@@ -225,7 +225,22 @@ g_ent=d.entries||[];renderDir();}catch(ex){document.getElementById('ls').innerHT
 function encodeURIComponent2(p){return encodeURIComponent(p).replace(/'/g,'%27');}
 function je(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");}
 function ha(s){return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;');}
-function dlBlob(url,name){var a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();document.body.removeChild(a);}
+// Download via fetch+blob so Chrome never applies its "insecure origin" /
+// "Check internet connection" block (which fires on link-click downloads from
+// self-signed-cert HTTPS pages, especially in AP mode with no real internet).
+async function dlBlob(url,name){
+  var btn=event&&event.target;if(btn)btn.disabled=true;
+  try{
+    var r=await fetch(url);
+    if(!r.ok){alert('Download error: HTTP '+r.status);return;}
+    var blob=await r.blob();
+    var burl=URL.createObjectURL(blob);
+    var a=document.createElement('a');a.href=burl;a.download=name;
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(function(){URL.revokeObjectURL(burl);},60000);
+  }catch(e){alert('Download failed: '+e);}
+  finally{if(btn)btn.disabled=false;}
+}
 async function rm(p){if(!confirm('Delete "'+p.split('/').pop()+'"?'))return;
 var r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+encodeURIComponent(p)});
 var d=await r.json();if(d.ok){if(g_sm)searchAll();else loadDir(cp);}else alert('Delete failed');}
