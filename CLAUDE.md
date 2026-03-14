@@ -29,7 +29,7 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 │   USB DRIVE MODE    │              │    NETWORK / SERVER MODE │
 │                     │              │                          │
 │  TinyUSB MSC active │◄── SWITCH ──►│  WiFi active             │
-│  SD card → PC       │              │  FTP + Web UI + Download │
+│  SD card → PC       │              │  HTTPS Web UI + Download │
 │  WiFi DISABLED      │              │  USB MSC DISABLED        │
 └─────────────────────┘              └──────────────────────────┘
 ```
@@ -49,9 +49,10 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 │  ┌─────────────────────┐   ┌────────────────────────────────┐  │
 │  │   USB DRIVE MODE    │   │       NETWORK MODE             │  │
 │  │  TinyUSB MSC        │   │  WiFi Stack                    │  │
-│  │  SD card → host     │   │  ├─ HTTP Web UI (port 80)      │  │
-│  │  (read/write)       │   │  ├─ Webhook API (/api/download) │  │
-│  └─────────────────────┘   │  ├─ Telegram Bot (HTTPS)       │  │
+│  │  SD card → host     │   │  ├─ HTTPS Web UI (port 443)    │  │
+│  │  (read/write)       │   │  ├─ HTTP→HTTPS redirect (80)   │  │
+│  └─────────────────────┘   │  ├─ Webhook API (/api/download) │  │
+│                             │  ├─ Telegram Bot (HTTPS)       │  │
 │                             │  └─ mDNS (usbdrive.local)     │  │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │               SHARED STORAGE LAYER                        │  │
@@ -73,8 +74,8 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 
 | Purpose         | Library                      | Notes                              |
 |-----------------|------------------------------|------------------------------------|
-| USB MSC         | `USB_MSC.h` (arduino-esp32)  | Built into Arduino Core 3.x        |
-| HTTP Server     | ESPAsyncWebServer            | mathieucarbou fork recommended      |
+| USB MSC         | `USBMSC.h` (arduino-esp32)   | Built into Arduino Core 2.x        |
+| HTTPS Server    | fhessel/esp32_https_server   | Port 443 + port 80 redirect; self-signed cert |
 | Telegram Bot    | AsyncTelegram2 (cotestatnt)  | Non-blocking, SSL, inline keyboards |
 | HTTP Downloader | HTTPClient (built-in)        | Stream-based chunked writes to SD  |
 | LCD Driver      | TFT_eSPI (Bodmer)            | ST7735 config, fast SPI            |
@@ -119,7 +120,7 @@ USB Server/
 │   ├── storage.cpp / .h      # SD card mount/unmount, stats, path helpers
 │   ├── usb_drive.cpp / .h    # TinyUSB MSC setup and callbacks
 │   ├── wifi_manager.cpp / .h # WiFi connect, AP fallback, captive portal, mDNS
-│   ├── web_server.cpp / .h   # AsyncWebServer routes + file manager
+│   ├── web_server.cpp / .h   # HTTPS server (fhessel) — all routes on port 443, port 80 redirect
 │   ├── downloader.cpp / .h   # HTTPClient + FreeRTOS download queue
 │   ├── telegram_bot.cpp / .h # AsyncTelegram2 bot integration
 │   ├── config.cpp / .h       # NVS Preferences read/write, defaults
@@ -138,8 +139,8 @@ USB Server/
 | Feature                     | Module                | Status   |
 |-----------------------------|-----------------------|----------|
 | USB Mass Storage (Drive Mode) | `usb_drive`         | [x] Hardware verified |
-| HTTP Config Dashboard       | `web_server`          | [x] Hardware verified |
-| HTTP File Manager           | `web_server`          | [ ] Todo (Phase 3 cont.) |
+| HTTPS Config Dashboard      | `web_server`          | [x] Hardware verified |
+| HTTPS File Manager          | `web_server`          | [~] Code written — pending hardware verify |
 | Direct URL download         | `downloader`          | [ ] Todo |
 | LCD UI with progress bar    | `lcd`                 | [x] Done |
 | WiFi connect from web/LCD   | `wifi_manager`        | [x] Done |
@@ -168,13 +169,12 @@ USB Server/
 |-----------------------------|-----------------------|----------|
 | QR code on LCD              | `lcd`                 | [ ] Todo |
 | Password protection (web)   | `web_server`+`config` | [ ] Todo |
-| FTP user/pass from NVS      | `ftp_server`+`config` | [~] Code written — pending verify |
 | Internal temp monitoring    | `main` + `lcd`        | [ ] Todo |
 | SD card stats on LCD        | `storage` + `lcd`     | [x] Done |
 | Auto-AP fallback            | `wifi_manager`        | [ ] Todo |
 | File type icons on LCD      | `lcd`                 | [ ] Todo |
 | Download history log        | `downloader`          | [ ] Todo |
-| HTTPS web UI (self-signed)  | `web_server`          | [ ] Todo |
+| HTTPS web UI (self-signed)  | `web_server`          | [x] Done — fhessel, port 443, port 80 redirect |
 
 ---
 
@@ -193,15 +193,18 @@ USB Server/
 - [x] LCD reflects active mode: lcd_show_usb_mode() / lcd_show_status()
 
 ### Phase 3 — Config Web UI `[~]` Partially hardware verified
-- [x] HTTP config dashboard at `http://[ip]/` — works in both STA and AP modes
+- [x] HTTPS config dashboard at `https://[ip]/` (self-signed cert, CN=usbdrive.local) — works in both STA and AP modes
+  - Port 443: all routes (fhessel/esp32_https_server)
+  - Port 80: HTTP→HTTPS redirect (captive portal NCSI passthrough in AP mode)
   - Status card: mode, WiFi, IP, storage
   - Soft mode switch (no button needed)
   - WiFi settings: scan (refreshes every 30 s, preserves selection) + save + restart
   - IP mode: "Automatic" (DHCP) or "Static IP" (IP/Mask/Gateway fields)
   - Theme selector: Dark / Ocean / Retro (live LCD preview)
+  - File manager: list, upload (raw binary), download, delete
 - [x] USB→Network mode switch via bat file — `Switch_to_Network_Mode.bat` on SD root
-  - Uses `mshta` Shell Eject: flushes FAT32 write cache then SCSI eject (~20 s, Windows lazy flush)
-  - Magic bytes fallback: `SWITCH_TO_NETWORK` string detected in `on_write` callback
+  - Writes `SWITCH_TO_NETWORK` to `/_switch_network.txt` (~20 s, Windows FAT32 lazy flush)
+  - Magic bytes: `on_write` detects `SWITCH_TO_NETWORK` string → immediate switch
   - SCSI eject fallback: checks for `/_switch_network.txt` on remount
 - [x] Button ≥3s in loop → WiFi reset (raised from 2s to prevent accidental resets)
 - [x] Themes: 3 palettes (Dark/Ocean/Retro), NVS-saved, live LCD apply — hardware verified
@@ -220,7 +223,7 @@ USB Server/
 - [~] Themes: 3 palettes (moved to Phase 3) — done
 - [ ] Auto-pack: `manifest.json` on SD root lists URLs → one-tap sync all
 - [ ] QR code on LCD: encodes web UI URL on boot
-- [ ] Password protection: HTTP Basic Auth, FTP credentials from NVS
+- [ ] Password protection: HTTPS Basic Auth
 - [ ] Temperature sensor: warn on LCD if chip > 75°C, log to SD
 
 ---
@@ -244,10 +247,10 @@ USB Server/
 
 - [ ] Drive Mode: plug into PC → removable drive appears → copy 1 GB file both directions
 - [ ] Mode switch: press button → WiFi connects in < 5s → LCD shows IP
-- [ ] Web UI: browser to `http://usbdrive.local` → file list → upload/download/delete
+- [ ] Web UI: browser to `https://usbdrive.local` (accept self-signed cert) → file list → upload/download/delete
 - [ ] URL Download: paste link in web UI → LCD shows progress → file on SD
 - [ ] Telegram: send `/download https://example.com/file.zip` → bot confirms → file appears
-- [ ] Webhook: `curl -X POST http://usbdrive.local/api/download -H "Content-Type: application/json" -d '{"url":"..."}'` → 200 OK → file queued
+- [ ] Webhook: `curl -X POST https://usbdrive.local/api/download -H "Content-Type: application/json" -d '{"url":"..."}'` → 200 OK → file queued
 - [ ] Theme: change theme in web UI → LCD palette updates immediately
 - [ ] Auto-pack: `manifest.json` on SD → tap Sync → all listed URLs download
 - [ ] Temp warning: simulate high temp → LCD warning appears
@@ -273,3 +276,6 @@ USB Server/
 | 3     | 2026-03-13 | Web UI improvements: IP mode renamed "DHCP"→"Automatic"; static IP fields reordered (IP/Mask/Gateway), DNS field removed; g_wf dirty flag prevents periodic load() from overwriting in-progress form edits; WiFi scan now refreshes every 30 s with SSID selection preserved. LCD lcd_show_status(): Static IP mode shows labeled IP/Mask/Gateway rows; DHCP shows "Automatic" label. |
 | 3     | 2026-03-13 | USB→Network bat file: replaced PowerShell approach with mshta+Shell Eject (flushes FAT32 write cache before SCSI eject). Both magic-bytes (on_write) and SCSI-eject paths supported; magic-bytes handler now removes /_switch_network.txt to prevent revert loop on next USB boot. |
 | 3     | 2026-03-13 | Bug fixes (hardware-verified): Fixed revert-to-Network loop after bat-triggered switch. Raised BOOT button WiFi reset threshold 2000→3000 ms to prevent accidental resets. HTTP config dashboard hardware-verified working. USB↔Network mode switching stable and reliable. USB→Network bat takes ~20 s (Windows FAT32 lazy flush — accepted). |
+| 3     | 2026-03-14 | Simplified bat file: removed mshta Shell Eject (no timing improvement). Bat now writes magic-bytes file only; relies on on_write detection + SCSI eject fallback. |
+| 3     | 2026-03-14 | HTTPS migration: replaced Arduino WebServer with fhessel/esp32_https_server. All routes migrated to port 443 (self-signed RSA-2048 cert, CN=usbdrive.local, 2 yr). Port 80 issues HTTP→HTTPS redirect; AP mode passes NCSI connecttest.txt through. Upload changed to raw binary body + path query param (no multipart). File manager download now works in Chrome (was blocked as insecure HTTP download). Patched HTTPConnection.hpp in library to replace missing hwcrypto/sha.h with inline mbedTLS shim. Build: RAM 22.9%, Flash 30.9%. |
+| —     | 2026-03-14 | GitHub repo created: https://github.com/mhmd2520/t-dongle-s3-usb-server. Tagged v0.1.0 as stable baseline. |

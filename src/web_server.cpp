@@ -4,14 +4,86 @@
 #include "storage.h"
 #include "themes.h"
 #include "lcd.h"
-#include <WebServer.h>
+#include "ssl_certs.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <SD_MMC.h>
 #include <vector>
+#include <HTTPSServer.hpp>
+#include <HTTPServer.hpp>
+#include <SSLCert.hpp>
+#include <HTTPRequest.hpp>
+#include <HTTPResponse.hpp>
+#include <ResourceNode.hpp>
 
-static WebServer g_http(80);
+using namespace httpsserver;
+
+// ── Server instances ──────────────────────────────────────────────────────────
+
+static SSLCert     g_cert((unsigned char*)SSL_CERT_DER, (uint16_t)SSL_CERT_DER_len,
+                           (unsigned char*)SSL_KEY_DER,  (uint16_t)SSL_KEY_DER_len);
+static HTTPSServer g_https(&g_cert, 443);
+static HTTPServer  g_http_redir(80);
+
+// Non-zero = restart at this millis() timestamp (after response is sent).
+static uint32_t g_restart_at = 0;
+
+// ── Helper functions ──────────────────────────────────────────────────────────
+
+static String url_decode(const String& s) {
+    String r;
+    for (int i = 0; i < (int)s.length(); i++) {
+        if (s[i] == '+') r += ' ';
+        else if (s[i] == '%' && i + 2 < (int)s.length()) {
+            char h[3] = {s[i+1], s[i+2], 0};
+            r += (char)strtol(h, nullptr, 16);
+            i += 2;
+        } else r += s[i];
+    }
+    return r;
+}
+
+static String read_body(HTTPRequest* req) {
+    String body;
+    uint8_t buf[128];
+    size_t len;
+    while (!req->requestComplete()) {
+        len = req->readBytes(buf, sizeof(buf));
+        for (size_t i = 0; i < len; i++) body += (char)buf[i];
+    }
+    return body;
+}
+
+// Parse a URL-encoded form body for a specific key.
+static String body_param(const String& body, const String& key) {
+    String prefix = key + "=";
+    int start = 0;
+    while (true) {
+        int pos = body.indexOf(prefix, start);
+        if (pos < 0) return "";
+        if (pos == 0 || body[pos - 1] == '&') {
+            int vs = pos + prefix.length();
+            int end = body.indexOf('&', vs);
+            if (end < 0) end = body.length();
+            return url_decode(body.substring(vs, end));
+        }
+        start = pos + 1;
+    }
+}
+
+static String query_param(HTTPRequest* req, const char* key) {
+    std::string val;
+    req->getParams()->getQueryParameter(std::string(key), val);
+    return String(val.c_str());
+}
+
+static void send_json(HTTPResponse* res, int code, const String& json) {
+    res->setStatusCode(code);
+    res->setHeader("Content-Type", "application/json");
+    res->setHeader("Content-Length", String(json.length()).c_str());
+    res->print(json.c_str());
+}
 
 // ── Cached WiFi scan ──────────────────────────────────────────────────────────
 
@@ -35,6 +107,9 @@ static String get_networks_html() {
 }
 
 // ── File Manager HTML ─────────────────────────────────────────────────────────
+// Upload uses raw binary body (Content-Type: application/octet-stream) with
+// the full destination path as a query parameter: POST /upload?path=/folder/file.txt
+// This avoids multipart parsing which is not built into fhessel.
 
 static const char FILEMAN_HTML[] =
 R"html(
@@ -178,13 +253,13 @@ function upXHR(file,path,fi,tot,pgEl,spdEl){return new Promise(function(res){var
 xhr.upload.onprogress=function(e){if(!e.lengthComputable)return;var el=(Date.now()-t0)/1000||.001,sp=e.loaded/el,rm=(e.total-e.loaded)/sp;pgEl.value=e.loaded;pgEl.max=e.total;spdEl.textContent=(fi+1)+'/'+tot+' \u00b7 '+fs(sp)+'/s \u00b7 '+ft(rm)+' left';};
 xhr.onload=function(){try{res(JSON.parse(xhr.responseText).ok);}catch(e){res(false);}};
 xhr.onerror=function(){res(false);};
-var fd=new FormData();fd.append('file',file);xhr.open('POST','/upload?path='+encodeURIComponent(path));xhr.send(fd);});}
+var fp=(path===''?'':path)+'/'+file.name;xhr.open('POST','/upload?path='+encodeURIComponent(fp));xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.send(file);})}
 async function doUp(mode){var fiEl=document.getElementById('fi'+mode),files=fiEl.files;if(!files.length)return;
 var pgEl=document.getElementById('pg'+mode),spdEl=document.getElementById('spd'+mode),umEl=document.getElementById('um'+mode);
 pgEl.style.display='block';spdEl.textContent='Starting\u2026';var failed=0;
 for(var i=0;i<files.length;i++){var file=files[i],destPath;
 if(mode===1&&file.webkitRelativePath){var rp=file.webkitRelativePath,ls2=rp.lastIndexOf('/');destPath=(cp==='/'?'':cp)+(ls2>0?'/'+rp.substring(0,ls2):'');}
-else{destPath=cp;}var ok=await upXHR(file,destPath,i,files.length,pgEl,spdEl);if(!ok)failed++;}
+else{destPath=cp==='/'?'':cp;}var ok=await upXHR(file,destPath,i,files.length,pgEl,spdEl);if(!ok)failed++;}
 pgEl.style.display='none';spdEl.textContent='';
 if(failed){umEl.textContent=failed+' file(s) failed';umEl.className='msg ng';}
 else{umEl.textContent='Done! '+files.length+' file'+(files.length>1?'s':'')+' uploaded';umEl.className='msg ok';}
@@ -342,21 +417,59 @@ load();loadNets();setInterval(load,12000);setInterval(loadNets,30000);
 </script>
 )html";
 
-// ── Route handlers ────────────────────────────────────────────────────────────
+// ── HTTP redirect handler (port 80) ──────────────────────────────────────────
 
-static void handle_root() {
-    // Inline DEVICE_NAME so the JS variable resolves without template substitution.
+static void handle_http_redirect(HTTPRequest* req, HTTPResponse* res) {
+    // Windows NCSI probe — answer directly so OS shows "Sign in to network" in AP mode.
+    if (wifi_is_ap_mode()) {
+        if (req->getRequestString().find("connecttest.txt") != std::string::npos) {
+            res->setStatusCode(200);
+            res->setHeader("Content-Type", "text/plain");
+            res->print("Microsoft Connect Test");
+            return;
+        }
+    }
+    String loc = "https://";
+    loc += wifi_is_ap_mode() ? AP_IP : wifi_ip();
+    loc += "/";
+    res->setStatusCode(301);
+    res->setHeader("Location", loc.c_str());
+    res->print("");
+}
+
+// ── HTTPS not-found handler ───────────────────────────────────────────────────
+
+static void handle_not_found(HTTPRequest* req, HTTPResponse* res) {
+    if (wifi_is_ap_mode()) {
+        res->setStatusCode(302);
+        res->setHeader("Location", "https://" AP_IP "/");
+        res->print("");
+        return;
+    }
+    res->setStatusCode(404);
+    res->setHeader("Content-Type", "text/plain");
+    res->print("Not found");
+}
+
+// ── Config route handlers ─────────────────────────────────────────────────────
+
+static void handle_root(HTTPRequest* req, HTTPResponse* res) {
     String page = PAGE_HTML;
     page.replace("DEVICE_NAME", "'" DEVICE_NAME "'");
-    g_http.send(200, "text/html", page);
+    res->setStatusCode(200);
+    res->setHeader("Content-Type", "text/html");
+    res->print(page.c_str());
 }
 
-static void handle_scan() {
-    g_http.send(200, "text/html", get_networks_html());
+static void handle_scan(HTTPRequest* req, HTTPResponse* res) {
+    String nets = get_networks_html();
+    res->setStatusCode(200);
+    res->setHeader("Content-Type", "text/html");
+    res->setHeader("Content-Length", String(nets.length()).c_str());
+    res->print(nets.c_str());
 }
 
-static void handle_status() {
-    // Read current mode from NVS (source of truth).
+static void handle_status(HTTPRequest* req, HTTPResponse* res) {
     Preferences p;
     p.begin(NVS_NS, true);
     uint8_t mode_val = p.getUChar(NVS_KEY_MODE, (uint8_t)MODE_NETWORK);
@@ -374,7 +487,6 @@ static void handle_status() {
     doc["sd_total"] = storage_total_gb();
     doc["theme"]    = (int)theme_current_id();
 
-    // Static IP config (stored in "wifi" NVS namespace alongside credentials)
     Preferences wP;
     wP.begin("wifi", true);
     doc["ip_mode"] = (int)wP.getUChar("ip_mode", 0);
@@ -385,13 +497,14 @@ static void handle_status() {
 
     String json;
     serializeJson(doc, json);
-    g_http.send(200, "application/json", json);
+    send_json(res, 200, json);
 }
 
-static void handle_mode() {
-    int mode = g_http.arg("mode").toInt();
+static void handle_mode(HTTPRequest* req, HTTPResponse* res) {
+    String body = read_body(req);
+    int mode = body_param(body, "mode").toInt();
     if (mode != (int)MODE_NETWORK && mode != (int)MODE_USB_DRIVE) {
-        g_http.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid mode\"}");
+        send_json(res, 400, "{\"ok\":false,\"error\":\"invalid mode\"}");
         return;
     }
     Preferences p;
@@ -400,57 +513,62 @@ static void handle_mode() {
     p.end();
     lcd_invalidate_layout();
     lcd_splash_msg("Switching...");
-    g_http.send(200, "application/json", "{\"ok\":true}");
-    delay(600);
-    ESP.restart();
+    send_json(res, 200, "{\"ok\":true}");
+    g_restart_at = millis() + 800;
 }
 
-static void handle_wifi() {
-    String ssid = g_http.arg("ssid");
-    String pass = g_http.arg("pass");
+static void handle_wifi(HTTPRequest* req, HTTPResponse* res) {
+    String body = read_body(req);
+    String ssid = body_param(body, "ssid");
+    String pass = body_param(body, "pass");
     if (ssid.isEmpty()) {
-        g_http.send(400, "application/json", "{\"ok\":false,\"error\":\"ssid required\"}");
+        send_json(res, 400, "{\"ok\":false,\"error\":\"ssid required\"}");
         return;
     }
     Preferences p;
     p.begin("wifi", false);
     p.putString("ssid", ssid);
     p.putString("pass", pass);
-    uint8_t ip_mode = (uint8_t)g_http.arg("ip_mode").toInt();
+    uint8_t ip_mode = (uint8_t)body_param(body, "ip_mode").toInt();
     p.putUChar("ip_mode", ip_mode);
     if (ip_mode == 1) {
-        String s_mask = g_http.arg("s_mask"); if (s_mask.isEmpty()) s_mask = "255.255.255.0";
-        p.putString("s_ip",   g_http.arg("s_ip"));
-        p.putString("s_gw",   g_http.arg("s_gw"));
+        String s_mask = body_param(body, "s_mask");
+        if (s_mask.isEmpty()) s_mask = "255.255.255.0";
+        p.putString("s_ip",   body_param(body, "s_ip"));
+        p.putString("s_gw",   body_param(body, "s_gw"));
         p.putString("s_mask", s_mask);
         p.putString("s_dns",  "8.8.8.8");
     }
     p.end();
-    g_http.send(200, "application/json", "{\"ok\":true}");
-    delay(500);
-    ESP.restart();
+    send_json(res, 200, "{\"ok\":true}");
+    g_restart_at = millis() + 800;
 }
 
-static void handle_wifi_reset() {
-    g_http.send(200, "application/json", "{\"ok\":true}");
-    delay(300);
-    wifi_reset_credentials();   // clears NVS and restarts
+static void handle_wifi_reset(HTTPRequest* req, HTTPResponse* res) {
+    // Read and discard body (required by fhessel before sending response).
+    read_body(req);
+    Preferences p;
+    p.begin("wifi", false);
+    p.clear();
+    p.end();
+    send_json(res, 200, "{\"ok\":true}");
+    g_restart_at = millis() + 800;
 }
 
-static void handle_theme() {
-    int id = g_http.arg("id").toInt();
+static void handle_theme(HTTPRequest* req, HTTPResponse* res) {
+    String body = read_body(req);
+    int id = body_param(body, "id").toInt();
     if (id < 0 || (uint8_t)id >= theme_count()) {
-        g_http.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid theme\"}");
+        send_json(res, 400, "{\"ok\":false,\"error\":\"invalid theme\"}");
         return;
     }
     theme_save((uint8_t)id);
-    lcd_apply_theme();   // live preview on LCD
-    g_http.send(200, "application/json", "{\"ok\":true}");
+    lcd_apply_theme();
+    send_json(res, 200, "{\"ok\":true}");
 }
 
 // ── File Manager handlers ─────────────────────────────────────────────────────
 
-// Recursively create all directories in path (SD_MMC.mkdir is not recursive).
 static void mkdirs(const String& path) {
     for (int i = 1; i < (int)path.length(); i++) {
         if (path[i] == '/') SD_MMC.mkdir(path.substring(0, i));
@@ -458,21 +576,23 @@ static void mkdirs(const String& path) {
     if (path.length() > 1) SD_MMC.mkdir(path);
 }
 
-static void handle_files_html() {
-    g_http.send(200, "text/html", FILEMAN_HTML);
+static void handle_files_html(HTTPRequest* req, HTTPResponse* res) {
+    res->setStatusCode(200);
+    res->setHeader("Content-Type", "text/html");
+    res->print(FILEMAN_HTML);
 }
 
-static void handle_list() {
+static void handle_list(HTTPRequest* req, HTTPResponse* res) {
     if (!storage_is_ready()) {
-        g_http.send(503, "application/json", "{\"error\":\"SD not ready\"}");
+        send_json(res, 503, "{\"error\":\"SD not ready\"}");
         return;
     }
-    String path = g_http.hasArg("path") ? g_http.arg("path") : "/";
+    String path = query_param(req, "path");
     if (path.isEmpty()) path = "/";
 
     File dir = SD_MMC.open(path);
     if (!dir || !dir.isDirectory()) {
-        g_http.send(404, "application/json", "{\"error\":\"not a directory\"}");
+        send_json(res, 404, "{\"error\":\"not a directory\"}");
         return;
     }
 
@@ -485,7 +605,6 @@ static void handle_list() {
     File entry = dir.openNextFile();
     while (entry) {
         String fullname = entry.name();
-        // SD_MMC returns full path from root; extract filename only.
         int slash = fullname.lastIndexOf('/');
         String name = slash >= 0 ? fullname.substring(slash + 1) : fullname;
         if (name.length() > 0) {
@@ -501,58 +620,59 @@ static void handle_list() {
 
     String json;
     serializeJson(doc, json);
-    g_http.send(200, "application/json", json);
+    send_json(res, 200, json);
 }
 
-// Static 8 KB buffer: avoids a large stack frame in the handler.
+// Static 8 KB buffer shared between file download and ZIP streaming.
 static uint8_t s_dl_buf[8192];
 
-static void handle_download() {
+static void handle_download(HTTPRequest* req, HTTPResponse* res) {
     if (!storage_is_ready()) {
-        g_http.send(503, "text/plain", "SD not ready");
+        send_json(res, 503, "{\"error\":\"SD not ready\"}");
         return;
     }
-    String path = g_http.arg("path");
+    String path = query_param(req, "path");
     if (path.isEmpty()) {
-        g_http.send(400, "text/plain", "path required");
+        res->setStatusCode(400);
+        res->setHeader("Content-Type", "text/plain");
+        res->print("path required");
         return;
     }
     File f = SD_MMC.open(path, FILE_READ);
     if (!f || f.isDirectory()) {
-        g_http.send(404, "text/plain", "Not found");
+        res->setStatusCode(404);
+        res->setHeader("Content-Type", "text/plain");
+        res->print("Not found");
         return;
     }
     String name = path.substring(path.lastIndexOf('/') + 1);
-    g_http.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
-    g_http.sendHeader("Cache-Control", "no-cache");
-    g_http.setContentLength(f.size());
-    g_http.send(200, "application/octet-stream", "");
+    res->setStatusCode(200);
+    res->setHeader("Content-Type", "application/octet-stream");
+    res->setHeader("Content-Disposition", ("attachment; filename=\"" + name + "\"").c_str());
+    res->setHeader("Cache-Control", "no-cache");
+    res->setHeader("Content-Length", String(f.size()).c_str());
     while (f.available()) {
         int n = f.read(s_dl_buf, sizeof(s_dl_buf));
-        if (n > 0) g_http.sendContent((const char*)s_dl_buf, n);
+        if (n > 0) res->write(s_dl_buf, (size_t)n);
         yield();
     }
     f.close();
 }
 
 // ── ZIP folder download ───────────────────────────────────────────────────────
-// Streams a stored (no-compression) ZIP of an entire SD directory.
-// CRC-32 is computed on-the-fly using a data descriptor after each file entry,
-// so the directory is only traversed once.  Content-Length is pre-calculated
-// from file sizes so the browser can show a progress bar.
 
 struct ZipEntry {
-    String   zip_name;   // relative path inside the ZIP
-    String   sd_path;    // absolute path on SD card
+    String   zip_name;
+    String   sd_path;
     uint32_t size;
     uint32_t crc;
-    uint32_t hdr_offset; // byte offset of local file header in the stream
+    uint32_t hdr_offset;
 };
 
 static std::vector<ZipEntry> s_zip_entries;
 static uint32_t              s_zip_offset;
+static HTTPResponse*         s_zip_res = nullptr;
 
-// Nibble-at-a-time CRC-32 (half-table, saves 48 bytes vs full table).
 static const uint32_t CRC_TAB[16] = {
     0x00000000,0x1db71064,0x3b6e20c8,0x26d930ac,
     0x76dc4190,0x6b6b51f4,0x4db26158,0x5005713c,
@@ -568,16 +688,18 @@ static uint32_t crc32_buf(uint32_t crc, const uint8_t* d, size_t n) {
     return ~crc;
 }
 
-static void zip_send(const void* d, size_t n) { g_http.sendContent((const char*)d, n); s_zip_offset += n; }
+static void zip_send(const void* d, size_t n) {
+    if (s_zip_res) s_zip_res->write((uint8_t*)d, n);
+    s_zip_offset += n;
+}
 static void zip_u16(uint16_t v) { uint8_t b[2]={uint8_t(v),uint8_t(v>>8)}; zip_send(b,2); }
 static void zip_u32(uint32_t v) { uint8_t b[4]={uint8_t(v),uint8_t(v>>8),uint8_t(v>>16),uint8_t(v>>24)}; zip_send(b,4); }
 
 static void zip_local_hdr(const String& name, uint32_t sz, bool dd) {
     uint16_t nl = name.length();
-    // flag 0x0808 = bit3 (data descriptor follows) + bit11 (UTF-8 filename)
     zip_u32(0x04034b50); zip_u16(20); zip_u16(dd ? 0x0808 : 0x0800);
-    zip_u16(0); zip_u16(0); zip_u16(0);              // compression, mod-time, mod-date
-    zip_u32(0); zip_u32(dd ? 0 : sz); zip_u32(dd ? 0 : sz); // crc=0 (filled by DD), sizes
+    zip_u16(0); zip_u16(0); zip_u16(0);
+    zip_u32(0); zip_u32(dd ? 0 : sz); zip_u32(dd ? 0 : sz);
     zip_u16(nl); zip_u16(0);
     zip_send(name.c_str(), nl);
 }
@@ -617,12 +739,14 @@ static void zip_collect(const String& sdp, const String& pre) {
     dir.close();
 }
 
-static void handle_download_zip() {
+static void handle_download_zip(HTTPRequest* req, HTTPResponse* res) {
     if (!storage_is_ready()) {
-        g_http.send(503, "text/plain", "SD not ready");
+        res->setStatusCode(503);
+        res->setHeader("Content-Type", "text/plain");
+        res->print("SD not ready");
         return;
     }
-    String path = g_http.arg("path");
+    String path = query_param(req, "path");
     if (path.isEmpty()) path = "/";
 
     s_zip_entries.clear();
@@ -635,27 +759,29 @@ static void handle_download_zip() {
     zip_collect(path, pre);
 
     if (s_zip_entries.empty()) {
-        g_http.send(404, "text/plain", "Folder is empty or not found");
+        res->setStatusCode(404);
+        res->setHeader("Content-Type", "text/plain");
+        res->print("Folder is empty or not found");
         return;
     }
 
-    // Pre-calculate exact ZIP byte length so the browser can show download progress.
-    // Per file: 30+nl (local hdr) + size (data) + 16 (data descriptor) + 46+nl (central dir)
-    uint32_t total = 22; // end-of-central-directory record
+    uint32_t total = 22;
     for (const auto& e : s_zip_entries) {
         uint16_t nl = e.zip_name.length();
-        total += 30 + nl + e.size + 16;  // local header + data + data descriptor
-        total += 46 + nl;                // central directory entry
+        total += 30 + nl + e.size + 16;
+        total += 46 + nl;
     }
 
     String fname = (path == "/") ? "sd_root" : path.substring(path.lastIndexOf('/') + 1);
     fname += ".zip";
-    g_http.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
-    g_http.sendHeader("Cache-Control", "no-cache");
-    g_http.setContentLength(total);
-    g_http.send(200, "application/zip", "");
+    res->setStatusCode(200);
+    res->setHeader("Content-Type", "application/zip");
+    res->setHeader("Content-Disposition", ("attachment; filename=\"" + fname + "\"").c_str());
+    res->setHeader("Cache-Control", "no-cache");
+    res->setHeader("Content-Length", String(total).c_str());
 
-    // Stream local file headers + raw file data
+    s_zip_res = res;
+
     for (auto& e : s_zip_entries) {
         e.hdr_offset = s_zip_offset;
         zip_local_hdr(e.zip_name, e.size, true);
@@ -673,84 +799,86 @@ static void handle_download_zip() {
         zip_data_desc(crc, e.size);
     }
 
-    // Central directory
     uint32_t cd_off = s_zip_offset;
     for (const auto& e : s_zip_entries) zip_central(e);
     uint32_t cd_sz = s_zip_offset - cd_off;
 
-    // End of central directory record
     uint16_t cnt = (uint16_t)s_zip_entries.size();
     zip_u32(0x06054b50); zip_u16(0); zip_u16(0);
     zip_u16(cnt); zip_u16(cnt);
     zip_u32(cd_sz); zip_u32(cd_off); zip_u16(0);
 
+    s_zip_res = nullptr;
     s_zip_entries.clear();
 }
 
-static File   s_upload_file;
-static String s_upload_dest;
-
-static void handle_upload_chunk() {
-    HTTPUpload& up = g_http.upload();
-    if (up.status == UPLOAD_FILE_START) {
-        String folder = g_http.hasArg("path") ? g_http.arg("path") : "/";
-        if (!folder.endsWith("/")) folder += "/";
-        s_upload_dest = folder + up.filename;
-        // Ensure all parent directories exist (required for folder uploads).
-        int last_slash = s_upload_dest.lastIndexOf('/');
-        if (last_slash > 0) mkdirs(s_upload_dest.substring(0, last_slash));
-        s_upload_file = SD_MMC.open(s_upload_dest, FILE_WRITE);
-        Serial.printf("[HTTP] Upload start: %s\n", s_upload_dest.c_str());
-    } else if (up.status == UPLOAD_FILE_WRITE) {
-        if (s_upload_file) s_upload_file.write(up.buf, up.currentSize);
-    } else if (up.status == UPLOAD_FILE_END) {
-        if (s_upload_file) { s_upload_file.close(); }
-        Serial.printf("[HTTP] Upload done: %s (%u bytes)\n",
-                      s_upload_dest.c_str(), up.totalSize);
-    } else if (up.status == UPLOAD_FILE_ABORTED) {
-        if (s_upload_file) { s_upload_file.close(); }
-        SD_MMC.remove(s_upload_dest);
+// Upload: raw binary body, full destination path as query param.
+// Client sends: POST /upload?path=/folder/file.txt
+//               Content-Type: application/octet-stream
+//               <raw file bytes>
+static void handle_upload(HTTPRequest* req, HTTPResponse* res) {
+    if (!storage_is_ready()) {
+        send_json(res, 503, "{\"ok\":false,\"error\":\"SD not ready\"}");
+        return;
     }
-}
-
-static void handle_upload_done() {
-    g_http.send(200, "application/json", "{\"ok\":true}");
-}
-
-static void handle_delete() {
-    String path = g_http.arg("path");
+    String path = query_param(req, "path");
     if (path.isEmpty()) {
-        g_http.send(400, "application/json", "{\"ok\":false}");
+        send_json(res, 400, "{\"ok\":false,\"error\":\"path required\"}");
+        return;
+    }
+    int last_slash = path.lastIndexOf('/');
+    if (last_slash > 0) mkdirs(path.substring(0, last_slash));
+
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (!f) {
+        send_json(res, 500, "{\"ok\":false,\"error\":\"cannot create file\"}");
+        return;
+    }
+    uint8_t buf[512];
+    size_t len;
+    while (!req->requestComplete()) {
+        len = req->readBytes(buf, sizeof(buf));
+        if (len > 0) f.write(buf, len);
+    }
+    f.close();
+    send_json(res, 200, "{\"ok\":true}");
+}
+
+static void handle_delete(HTTPRequest* req, HTTPResponse* res) {
+    String body = read_body(req);
+    String path = body_param(body, "path");
+    if (path.isEmpty()) {
+        send_json(res, 400, "{\"ok\":false}");
         return;
     }
     bool ok = SD_MMC.remove(path) || SD_MMC.rmdir(path);
-    g_http.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    send_json(res, 200, ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
-static void handle_mkdir() {
-    String path = g_http.arg("path");
+static void handle_mkdir(HTTPRequest* req, HTTPResponse* res) {
+    String body = read_body(req);
+    String path = body_param(body, "path");
     if (path.isEmpty()) {
-        g_http.send(400, "application/json", "{\"ok\":false}");
+        send_json(res, 400, "{\"ok\":false}");
         return;
     }
     bool ok = SD_MMC.mkdir(path);
-    g_http.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    send_json(res, 200, ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
-static void handle_rename() {
-    String from = g_http.arg("from");
-    String to   = g_http.arg("to");
+static void handle_rename(HTTPRequest* req, HTTPResponse* res) {
+    String body = read_body(req);
+    String from = body_param(body, "from");
+    String to   = body_param(body, "to");
     if (from.isEmpty() || to.isEmpty()) {
-        g_http.send(400, "application/json", "{\"ok\":false,\"error\":\"params required\"}");
+        send_json(res, 400, "{\"ok\":false,\"error\":\"params required\"}");
         return;
     }
     bool ok = SD_MMC.rename(from, to);
-    g_http.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"rename failed\"}");
+    send_json(res, 200, ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"rename failed\"}");
 }
 
 // ── Global search ─────────────────────────────────────────────────────────────
-// Recursively walks the SD card and collects entries whose name contains q.
-// Results are capped at 200 to limit JSON size.
 
 static void search_walk(const String& sdp, const String& q, JsonArray arr, int& cnt) {
     if (cnt >= 200) return;
@@ -774,9 +902,7 @@ static void search_walk(const String& sdp, const String& q, JsonArray arr, int& 
                 if (!f.isDirectory()) obj["size"] = (uint32_t)f.size();
                 cnt++;
             }
-            if (f.isDirectory()) {
-                search_walk(fn, q, arr, cnt);
-            }
+            if (f.isDirectory()) search_walk(fn, q, arr, cnt);
         }
         f.close();
         f = dir.openNextFile();
@@ -784,15 +910,15 @@ static void search_walk(const String& sdp, const String& q, JsonArray arr, int& 
     dir.close();
 }
 
-static void handle_search() {
+static void handle_search(HTTPRequest* req, HTTPResponse* res) {
     if (!storage_is_ready()) {
-        g_http.send(503, "application/json", "{\"error\":\"SD not ready\"}");
+        send_json(res, 503, "{\"error\":\"SD not ready\"}");
         return;
     }
-    String q = g_http.arg("q");
+    String q = query_param(req, "q");
     q.toLowerCase();
     if (q.isEmpty()) {
-        g_http.send(400, "application/json", "{\"error\":\"q required\"}");
+        send_json(res, 400, "{\"error\":\"q required\"}");
         return;
     }
     JsonDocument doc;
@@ -803,52 +929,46 @@ static void handle_search() {
     search_walk("/", q, arr, cnt);
     String json;
     serializeJson(doc, json);
-    g_http.send(200, "application/json", json);
-}
-
-static void handle_not_found() {
-    if (!wifi_is_ap_mode()) {
-        g_http.send(404, "text/plain", "Not found");
-        return;
-    }
-    // Windows captive-portal detection: expects "Microsoft Connect Test" from
-    // /connecttest.txt — returning it tells Windows the portal is active and
-    // triggers the "Sign in to network" notification correctly.
-    String uri = g_http.uri();
-    if (uri == "/connecttest.txt") {
-        g_http.send(200, "text/plain", "Microsoft Connect Test");
-        return;
-    }
-    // All other unknown paths → redirect to config dashboard.
-    g_http.sendHeader("Location", "http://" AP_IP "/", true);
-    g_http.send(302, "text/plain", "");
+    send_json(res, 200, json);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 void web_server_begin() {
-    g_http.on("/",             HTTP_GET,  handle_root);
-    g_http.on("/api/status",   HTTP_GET,  handle_status);
-    g_http.on("/api/scan",     HTTP_GET,  handle_scan);
-    g_http.on("/api/mode",     HTTP_POST, handle_mode);
-    g_http.on("/api/wifi",     HTTP_POST, handle_wifi);
-    g_http.on("/api/wifi-reset", HTTP_POST, handle_wifi_reset);
-    g_http.on("/api/theme",    HTTP_POST, handle_theme);
-    // ── File Manager ──────────────────────────────────────────────────────────
-    g_http.on("/files",      HTTP_GET,  handle_files_html);
-    g_http.on("/api/list",   HTTP_GET,  handle_list);
-    g_http.on("/api/search", HTTP_GET,  handle_search);
-    g_http.on("/download",     HTTP_GET,  handle_download);
-    g_http.on("/download-zip", HTTP_GET,  handle_download_zip);
-    g_http.on("/upload",     HTTP_POST, handle_upload_done, handle_upload_chunk);
-    g_http.on("/api/delete", HTTP_POST, handle_delete);
-    g_http.on("/api/mkdir",  HTTP_POST, handle_mkdir);
-    g_http.on("/api/rename", HTTP_POST, handle_rename);
-    g_http.onNotFound(handle_not_found);
-    g_http.begin();
-    Serial.println("[HTTP] Config server started on port 80");
+    // ── HTTPS server (port 443) — all routes ─────────────────────────────────
+    g_https.registerNode(new ResourceNode("/",               "GET",  handle_root));
+    g_https.registerNode(new ResourceNode("/api/status",     "GET",  handle_status));
+    g_https.registerNode(new ResourceNode("/api/scan",       "GET",  handle_scan));
+    g_https.registerNode(new ResourceNode("/api/mode",       "POST", handle_mode));
+    g_https.registerNode(new ResourceNode("/api/wifi",       "POST", handle_wifi));
+    g_https.registerNode(new ResourceNode("/api/wifi-reset", "POST", handle_wifi_reset));
+    g_https.registerNode(new ResourceNode("/api/theme",      "POST", handle_theme));
+    g_https.registerNode(new ResourceNode("/files",          "GET",  handle_files_html));
+    g_https.registerNode(new ResourceNode("/api/list",       "GET",  handle_list));
+    g_https.registerNode(new ResourceNode("/api/search",     "GET",  handle_search));
+    g_https.registerNode(new ResourceNode("/download",       "GET",  handle_download));
+    g_https.registerNode(new ResourceNode("/download-zip",   "GET",  handle_download_zip));
+    g_https.registerNode(new ResourceNode("/upload",         "POST", handle_upload));
+    g_https.registerNode(new ResourceNode("/api/delete",     "POST", handle_delete));
+    g_https.registerNode(new ResourceNode("/api/mkdir",      "POST", handle_mkdir));
+    g_https.registerNode(new ResourceNode("/api/rename",     "POST", handle_rename));
+    g_https.setDefaultNode(new ResourceNode("", "GET", handle_not_found));
+    g_https.start();
+
+    // ── HTTP server (port 80) — redirect everything to HTTPS ─────────────────
+    g_http_redir.setDefaultNode(new ResourceNode("", "GET", handle_http_redirect));
+    g_http_redir.start();
+
+    Serial.println("[HTTPS] Server started on port 443");
+    Serial.println("[HTTP]  Redirect server started on port 80");
 }
 
 void web_server_loop() {
-    g_http.handleClient();
+    g_https.loop();
+    g_http_redir.loop();
+    // Deferred restart: lets the handler return and the response be fully sent
+    // before the device restarts. Set g_restart_at = millis() + delay in handlers.
+    if (g_restart_at > 0 && millis() >= g_restart_at) {
+        ESP.restart();
+    }
 }
