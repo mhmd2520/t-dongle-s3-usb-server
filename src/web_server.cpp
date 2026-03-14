@@ -626,6 +626,18 @@ static void handle_list(HTTPRequest* req, HTTPResponse* res) {
 // Static 8 KB buffer shared between file download and ZIP streaming.
 static uint8_t s_dl_buf[8192];
 
+// SSL_write (via fhessel → mbedTLS) may accept fewer bytes than requested
+// on a single call (partial write). Loop until all bytes are sent or the
+// connection is closed.
+static void res_write_all(HTTPResponse* res, const uint8_t* buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        size_t n = res->write(buf + sent, len - sent);
+        if (n == 0) break;   // connection closed or error
+        sent += n;
+    }
+}
+
 static void handle_download(HTTPRequest* req, HTTPResponse* res) {
     if (!storage_is_ready()) {
         send_json(res, 503, "{\"error\":\"SD not ready\"}");
@@ -653,7 +665,7 @@ static void handle_download(HTTPRequest* req, HTTPResponse* res) {
     res->setHeader("Content-Length", String(f.size()).c_str());
     while (f.available()) {
         int n = f.read(s_dl_buf, sizeof(s_dl_buf));
-        if (n > 0) res->write(s_dl_buf, (size_t)n);
+        if (n > 0) res_write_all(res, s_dl_buf, (size_t)n);
         yield();
     }
     f.close();
@@ -689,7 +701,7 @@ static uint32_t crc32_buf(uint32_t crc, const uint8_t* d, size_t n) {
 }
 
 static void zip_send(const void* d, size_t n) {
-    if (s_zip_res) s_zip_res->write((uint8_t*)d, n);
+    if (s_zip_res) res_write_all(s_zip_res, (const uint8_t*)d, n);
     s_zip_offset += n;
 }
 static void zip_u16(uint16_t v) { uint8_t b[2]={uint8_t(v),uint8_t(v>>8)}; zip_send(b,2); }
