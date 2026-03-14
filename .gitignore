@@ -1,0 +1,19 @@
+# PlatformIO build artifacts
+.pio/
+
+# VSCode local settings
+.vscode/
+
+# SSL certs and private keys (never commit secrets)
+src/ssl_certs.h
+*.key
+*.crt
+*.pem
+*.der
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store

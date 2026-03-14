@@ -1,0 +1,9 @@
+# Normalize line endings to LF in repo, checkout as-is on Windows
+* text=auto
+*.cpp text eol=lf
+*.h text eol=lf
+*.ini text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+*.bat text eol=crlf

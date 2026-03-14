@@ -1,0 +1,9 @@
+# T-Dongle-S3 partition table — 16 MB flash
+# Provides 4 MB app space (Phase 1-5 all libraries fit), OTA slot, 8 MB SPIFFS (Phase 3 web UI)
+#
+# Name,     Type, SubType,  Offset,    Size,     Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xe000,    0x2000,
+app0,       app,  ota_0,    0x10000,   0x400000,
+app1,       app,  ota_1,    0x410000,  0x400000,
+spiffs,     data, spiffs,   0x810000,  0x7F0000,
