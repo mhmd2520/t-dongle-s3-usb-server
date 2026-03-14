@@ -695,11 +695,11 @@ static void zip_send(const void* d, size_t n) {
 static void zip_u16(uint16_t v) { uint8_t b[2]={uint8_t(v),uint8_t(v>>8)}; zip_send(b,2); }
 static void zip_u32(uint32_t v) { uint8_t b[4]={uint8_t(v),uint8_t(v>>8),uint8_t(v>>16),uint8_t(v>>24)}; zip_send(b,4); }
 
-static void zip_local_hdr(const String& name, uint32_t sz, bool dd) {
+static void zip_local_hdr(const String& name, uint32_t crc, uint32_t sz) {
     uint16_t nl = name.length();
-    zip_u32(0x04034b50); zip_u16(20); zip_u16(dd ? 0x0808 : 0x0800);
-    zip_u16(0); zip_u16(0); zip_u16(0);
-    zip_u32(0); zip_u32(dd ? 0 : sz); zip_u32(dd ? 0 : sz);
+    zip_u32(0x04034b50); zip_u16(20); zip_u16(0x0800);  // UTF-8, no data descriptor
+    zip_u16(0); zip_u16(0); zip_u16(0);                  // method=stored, mtime=0, mdate=0
+    zip_u32(crc); zip_u32(sz); zip_u32(sz);              // CRC, compressed=sz, uncompressed=sz
     zip_u16(nl); zip_u16(0);
     zip_send(name.c_str(), nl);
 }
@@ -739,6 +739,26 @@ static void zip_collect(const String& sdp, const String& pre) {
     dir.close();
 }
 
+// Pre-read all collected files to compute CRCs before streaming.
+// This avoids the data-descriptor (DD) approach where local header CRC=0,
+// which causes 7-Zip / WinZip to scan for the PK\x07\x08 signature byte
+// sequence inside binary files (e.g. PNG), resulting in CRC errors.
+static void zip_precompute_crcs() {
+    for (auto& e : s_zip_entries) {
+        File f = SD_MMC.open(e.sd_path, FILE_READ);
+        uint32_t crc = 0;
+        if (f) {
+            while (f.available()) {
+                int n = f.read(s_dl_buf, sizeof(s_dl_buf));
+                if (n > 0) crc = crc32_buf(crc, s_dl_buf, n);
+                yield();
+            }
+            f.close();
+        }
+        e.crc = crc;
+    }
+}
+
 static void handle_download_zip(HTTPRequest* req, HTTPResponse* res) {
     if (!storage_is_ready()) {
         res->setStatusCode(503);
@@ -765,11 +785,17 @@ static void handle_download_zip(HTTPRequest* req, HTTPResponse* res) {
         return;
     }
 
-    uint32_t total = 22;
+    // Pass 1: compute CRCs so local headers are complete (no data descriptor needed).
+    // This avoids 7-Zip/WinZip scanning for PK\x07\x08 inside binary file data.
+    zip_precompute_crcs();
+
+    // Content-Length: local headers + file data + central directory + EOCD
+    // (No data descriptors since we have CRCs up front.)
+    uint32_t total = 22;  // EOCD
     for (const auto& e : s_zip_entries) {
         uint16_t nl = e.zip_name.length();
-        total += 30 + nl + e.size + 16;
-        total += 46 + nl;
+        total += 30 + nl + e.size;  // local header + file data (no data descriptor)
+        total += 46 + nl;           // central directory entry
     }
 
     String fname = (path == "/") ? "sd_root" : path.substring(path.lastIndexOf('/') + 1);
@@ -780,23 +806,22 @@ static void handle_download_zip(HTTPRequest* req, HTTPResponse* res) {
     res->setHeader("Cache-Control", "no-cache");
     res->setHeader("Content-Length", String(total).c_str());
 
+    // Pass 2: stream ZIP — local header with correct CRC + size, then file data.
     s_zip_res = res;
 
     for (auto& e : s_zip_entries) {
         e.hdr_offset = s_zip_offset;
-        zip_local_hdr(e.zip_name, e.size, true);
+        zip_local_hdr(e.zip_name, e.crc, e.size);
         File f = SD_MMC.open(e.sd_path, FILE_READ);
-        uint32_t crc = 0;
         if (f) {
             while (f.available()) {
                 int n = f.read(s_dl_buf, sizeof(s_dl_buf));
-                if (n > 0) { crc = crc32_buf(crc, s_dl_buf, n); zip_send(s_dl_buf, n); }
+                if (n > 0) zip_send(s_dl_buf, n);
                 yield();
             }
             f.close();
         }
-        e.crc = crc;
-        zip_data_desc(crc, e.size);
+        // No data descriptor — CRC and size are already in the local header.
     }
 
     uint32_t cd_off = s_zip_offset;
