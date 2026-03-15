@@ -82,30 +82,21 @@ static bool try_connect(const String& ssid, const String& pass, uint32_t timeout
 // ── AP mode (non-blocking) ────────────────────────────────────────────────────
 
 static void start_ap_mode() {
-    // Tear down STA completely. WIFI_AP_STA keeps the STA interface alive and
-    // its internal auto-reconnect/probe scanning hops channels and drops AP
-    // clients. Pure WIFI_AP has no STA side at all — AP is rock-solid.
-    // ESP-IDF supports WiFi.scanNetworks() in AP mode via the onboard radio
-    // sharing, so the Refresh button still works in the web UI.
+    // Cleanly tear down any pending STA connection before starting AP,
+    // otherwise the failed STA state can prevent the AP from advertising.
     WiFi.disconnect(false);
     WiFi.mode(WIFI_OFF);
-    delay(300);  // let the stack fully teardown before re-init
-    WiFi.mode(WIFI_AP);
     delay(100);
-    // Explicitly set AP IP, gateway, and subnet before starting softAP.
-    // This forces the DHCP server to hand out the correct gateway (192.168.4.1)
-    // so clients can reach the web server without guessing the gateway IP.
-    WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1),
-                      IPAddress(255,255,255,0));
-    bool ok = WiFi.softAP(AP_SSID, AP_PASS);
-    delay(200);  // allow AP/DHCP server to fully initialize
+    // AP+STA allows WiFi scanning while hosting the AP.
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, AP_PASS);
 
     // DNS: redirect all hostnames to the AP IP for OS captive-portal detection.
     g_dns.start(53, "*", IPAddress(192, 168, 4, 1));
 
     g_ap_mode = true;
-    Serial.printf("[WiFi] Config AP %s — SSID: %s  Pass: %s  IP: %s\n",
-                  ok ? "started" : "FAILED", AP_SSID, AP_PASS, AP_IP);
+    Serial.printf("[WiFi] Config AP started — SSID: %s  Pass: %s  IP: %s\n",
+                  AP_SSID, AP_PASS, AP_IP);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

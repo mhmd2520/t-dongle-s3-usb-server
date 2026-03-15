@@ -1058,10 +1058,9 @@ void web_server_begin() {
 }
 
 void web_server_loop() {
-    // Async WiFi scan — STA mode only, every 30 s.
-    // AP mode excluded: no background scanning in AP mode.
-    if (!wifi_is_ap_mode() &&
-        WiFi.scanComplete() != WIFI_SCAN_RUNNING &&
+    // Async WiFi scan — every 30 s, both STA and AP mode.
+    // Called from main loop (Core 1) only — never from async handlers.
+    if (WiFi.scanComplete() != WIFI_SCAN_RUNNING &&
         millis() - g_scan_trigger_ts > 30000UL) {
         WiFi.scanNetworks(true);
         g_scan_trigger_ts = millis();
