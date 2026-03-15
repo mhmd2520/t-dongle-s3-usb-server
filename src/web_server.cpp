@@ -60,13 +60,11 @@ static uint32_t crc32_feed(uint32_t state, const uint8_t* buf, size_t len) {
     return state;
 }
 
-// ── Cached WiFi scan (async, never blocks main loop) ──────────────────────────
-// STA mode: web_server_loop() chain-scans (~2-3 s cycle). get_networks_html()
-// reads results + calls scanDelete(); next loop sees idle state and restarts.
-// AP mode: NO automatic scanning of any kind. WiFi.scanNetworks() makes the
-// radio hop channels for ~2-3 s which drops every AP client — including the
-// one that just loaded the page. Scans are triggered ONLY by the browser
-// sending /api/scan?start=1 (the ↻ Refresh button in the dashboard).
+// ── Cached WiFi scan — manual only in all modes ───────────────────────────────
+// No automatic background scanning in either AP or STA mode.
+// The ↻ Refresh button sends /api/scan?start=1 which triggers one scan.
+// handle_scan returns the cached result immediately; the browser JS polls
+// every 1 s via refreshNets() until fresh results arrive (~2-3 s scan time).
 
 static String   g_scan_cache;
 static uint32_t g_scan_ts         = 0;
@@ -545,15 +543,11 @@ static void handle_status(AsyncWebServerRequest* req) {
 
 // /api/init — status + WiFi scan in one round-trip (saves one HTTP connection)
 static void handle_init(AsyncWebServerRequest* req) {
-    // NEVER trigger a scan here — in AP mode, calling WiFi.scanNetworks() while
-    // a client is actively connecting drops the AP link mid-response, making the
-    // page fail to load (the root cause of "WiFi AP not accessible").
-    // In STA mode, background chain-scanning keeps g_scan_cache fresh already.
+    // Never trigger a scan on page load — in both modes the user clicks ↻ Refresh.
     JsonDocument doc;
     fill_status_json(doc);
-    // In AP mode with no cached results yet, show "click Refresh" placeholder so
-    // the page loads cleanly without triggering any scan.
-    if (wifi_is_ap_mode() && g_scan_cache.isEmpty()) {
+    // Show "click Refresh" placeholder until the user has run at least one scan.
+    if (g_scan_cache.isEmpty()) {
         doc["scan_html"] = "<option value=''>\u21BB Click Refresh to scan\u2026</option>";
     } else {
         doc["scan_html"] = get_networks_html();
@@ -1062,14 +1056,6 @@ void web_server_begin() {
 }
 
 void web_server_loop() {
-    // Async WiFi scan — every 30 s, both STA and AP mode.
-    // Called from main loop (Core 1) only — never from async handlers.
-    if (WiFi.scanComplete() != WIFI_SCAN_RUNNING &&
-        millis() - g_scan_trigger_ts > 30000UL) {
-        WiFi.scanNetworks(true);
-        g_scan_trigger_ts = millis();
-    }
-
     // Busy watchdog: if a heavy operation stalls (dropped connection) for >30 s,
     // free any in-flight ZIP buffer and clear the busy flag.
     static uint32_t s_busy_since = 0;
