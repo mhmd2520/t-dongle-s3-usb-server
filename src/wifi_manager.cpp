@@ -92,8 +92,13 @@ static void start_ap_mode() {
     delay(300);  // let the stack fully teardown before re-init
     WiFi.mode(WIFI_AP);
     delay(100);
+    // Explicitly set AP IP, gateway, and subnet before starting softAP.
+    // This forces the DHCP server to hand out the correct gateway (192.168.4.1)
+    // so clients can reach the web server without guessing the gateway IP.
+    WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1),
+                      IPAddress(255,255,255,0));
     bool ok = WiFi.softAP(AP_SSID, AP_PASS);
-    delay(100);  // allow AP/DHCP server to fully initialize
+    delay(200);  // allow AP/DHCP server to fully initialize
 
     // DNS: redirect all hostnames to the AP IP for OS captive-portal detection.
     g_dns.start(53, "*", IPAddress(192, 168, 4, 1));

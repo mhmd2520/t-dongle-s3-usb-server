@@ -467,6 +467,7 @@ loadInit();setInterval(load,12000);setInterval(loadNets,30000);
 // ── Route handlers ─────────────────────────────────────────────────────────────
 
 static void handle_root(AsyncWebServerRequest* req) {
+    Serial.printf("[HTTP] GET / from %s\n", req->client()->remoteIP().toString().c_str());
     String page = PAGE_HTML;
     page.replace("DEVICE_NAME", "'" DEVICE_NAME "'");
     req->send(200, "text/html", page);
@@ -477,13 +478,27 @@ static void handle_files_html(AsyncWebServerRequest* req) {
 }
 
 static void handle_not_found(AsyncWebServerRequest* req) {
-    // Captive portal: in AP mode serve NCSI probe so Windows shows "Sign in to network".
+    Serial.printf("[HTTP] %s %s from %s\n",
+                  req->methodToString(), req->url().c_str(),
+                  req->client()->remoteIP().toString().c_str());
     if (wifi_is_ap_mode()) {
+        // Android connectivity check — must return 204 No Content or Android
+        // thinks there is internet and routes all browser traffic via LTE instead
+        // of WiFi, making 192.168.4.1 unreachable from the browser.
+        if (req->url().indexOf("generate_204") >= 0 ||
+            req->url().indexOf("gen_204")      >= 0) {
+            req->send(204, "text/plain", "");
+            return;
+        }
+        // Windows NCSI — returning correct response lets Windows mark WiFi as
+        // "internet available" (no yellow triangle) while still allowing the
+        // user to navigate to 192.168.4.1 manually.
         if (req->url().indexOf("connecttest.txt") >= 0 ||
-            req->url().indexOf("generate_204") >= 0) {
+            req->url().indexOf("ncsi.txt")        >= 0) {
             req->send(200, "text/plain", "Microsoft Connect Test");
             return;
         }
+        // iOS/macOS captive portal — redirect triggers the system captive browser.
         req->redirect("http://" AP_IP "/");
         return;
     }
