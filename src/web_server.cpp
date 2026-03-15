@@ -61,13 +61,12 @@ static uint32_t crc32_feed(uint32_t state, const uint8_t* buf, size_t len) {
 }
 
 // ── Cached WiFi scan (async, never blocks main loop) ──────────────────────────
-// STA mode: web_server_loop() starts a new scan immediately after the previous
-// completes (~2-3 s natural cycle). get_networks_html() reads results and calls
-// scanDelete(); the next loop iteration sees idle state and restarts.
-// AP mode: background scanning DISABLED — WiFi.scanNetworks() causes the radio
-// to hop channels for ~2-3 s, dropping every client associated with the AP.
-// Instead, handle_init/handle_scan trigger one scan on-demand when the browser
-// explicitly requests network data.
+// STA mode: web_server_loop() chain-scans (~2-3 s cycle). get_networks_html()
+// reads results + calls scanDelete(); next loop sees idle state and restarts.
+// AP mode: NO automatic scanning of any kind. WiFi.scanNetworks() makes the
+// radio hop channels for ~2-3 s which drops every AP client — including the
+// one that just loaded the page. Scans are triggered ONLY by the browser
+// sending /api/scan?start=1 (the ↻ Refresh button in the dashboard).
 
 static String   g_scan_cache;
 static uint32_t g_scan_ts         = 0;
@@ -354,8 +353,8 @@ input,select{width:100%;padding:8px;background:#1c1c1c;border:1px solid #2a2a2a;
 </div>
 
 <div class="card"><h2>WiFi Settings</h2>
-  <label>Network</label>
-  <select id="w-ssid" onchange="g_wf=true"><option>Loading...</option></select>
+  <label style="display:flex;justify-content:space-between;align-items:center"><span>Network</span><button type="button" class="btn cyan" style="padding:3px 9px;font-size:.72em;margin:0;width:auto" onclick="refreshNets()">&#8635; Refresh</button></label>
+  <select id="w-ssid" onchange="g_wf=true"><option>Loading&#8230;</option></select>
   <label>Password</label>
   <input type="password" id="w-pass" placeholder="Leave blank for open networks" oninput="g_wf=true">
   <label>IP Mode</label>
@@ -419,6 +418,16 @@ async function load(){
 }
 async function loadNets(){
   try{var r=await fetch('/api/scan');applyScan(await r.text());}catch(e){}
+}
+async function refreshNets(){
+  document.getElementById('w-ssid').innerHTML='<option>Scanning\u2026</option>';
+  try{await fetch('/api/scan?start=1');}catch(e){return;}
+  for(var i=0;i<7;i++){
+    await new Promise(function(r){setTimeout(r,1000);});
+    try{var r=await fetch('/api/scan');var h=await r.text();
+    if(h.indexOf('Scanning')<0&&h.indexOf('Refresh')<0){applyScan(h);return;}}catch(e){}
+  }
+  try{var r2=await fetch('/api/scan');applyScan(await r2.text());}catch(e){}
 }
 async function switchMode(){
   var next=d.mode===1?0:1;
@@ -517,22 +526,30 @@ static void handle_status(AsyncWebServerRequest* req) {
 
 // /api/init — status + WiFi scan in one round-trip (saves one HTTP connection)
 static void handle_init(AsyncWebServerRequest* req) {
-    // In AP mode: trigger an on-demand scan when the browser opens the page.
-    // Background scanning is disabled in AP mode (see comment near g_scan_cache).
-    if (wifi_is_ap_mode() && WiFi.scanComplete() == WIFI_SCAN_FAILED) {
-        WiFi.scanNetworks(true);
-    }
+    // NEVER trigger a scan here — in AP mode, calling WiFi.scanNetworks() while
+    // a client is actively connecting drops the AP link mid-response, making the
+    // page fail to load (the root cause of "WiFi AP not accessible").
+    // In STA mode, background chain-scanning keeps g_scan_cache fresh already.
     JsonDocument doc;
     fill_status_json(doc);
-    doc["scan_html"] = get_networks_html();
+    // In AP mode with no cached results yet, show "click Refresh" placeholder so
+    // the page loads cleanly without triggering any scan.
+    if (wifi_is_ap_mode() && g_scan_cache.isEmpty()) {
+        doc["scan_html"] = "<option value=''>\u21BB Click Refresh to scan\u2026</option>";
+    } else {
+        doc["scan_html"] = get_networks_html();
+    }
     String json;
     serializeJson(doc, json);
     send_json(req, 200, json);
 }
 
 static void handle_scan(AsyncWebServerRequest* req) {
-    // In AP mode: trigger a new scan only when idle (results already consumed).
-    if (wifi_is_ap_mode() && WiFi.scanComplete() == WIFI_SCAN_FAILED) {
+    // Scan is triggered ONLY when the browser explicitly passes ?start=1
+    // (the Refresh button). Without start=1 this is read-only (returns cache).
+    // This way setInterval(loadNets) never starts a scan automatically in AP mode.
+    if (req->hasParam("start") && WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
+        if (WiFi.scanComplete() >= 0) WiFi.scanDelete();  // discard stale results
         WiFi.scanNetworks(true);
     }
     req->send(200, "text/html", get_networks_html());
