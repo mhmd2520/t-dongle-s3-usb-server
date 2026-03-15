@@ -219,7 +219,7 @@ USB Server/
 - [ ] QR code on LCD: encodes web UI URL on boot
 - [ ] Password protection: HTTP Basic Auth
 - [ ] Temperature sensor: warn on LCD if chip > 75°C, log to SD
-- [ ] Filter system files (`/_dl_tmp.zip`, `/_switch_network.txt`) from file manager listing
+- [x] Filter system files from file manager listing, search, and ZIP — `is_system_entry()` hides Windows (`System Volume Information`, `$RECYCLE.BIN`, `$*`), macOS (`._*`, `.Trashes`, `.Spotlight-V100`, `.fseventsd`), and internal temp file (`_dl_tmp.zip`)
 - [ ] ZIP temp file cleanup: delete `/_dl_tmp.zip` after streaming completes
 - [ ] Sort WiFi scan results by RSSI (strongest first)
 - [ ] Track upload write errors: check `file.write()` return per chunk
@@ -301,3 +301,4 @@ USB Server/
 | 3     | 2026-03-15 | **Button WiFi reset**: lowered threshold 3000 ms → 2000 ms. LCD message updated to "Hold BOOT 2s". |
 | 3     | 2026-03-15 | **New folder toast**: `mkD()` in FILEMAN_HTML shows setBusy/showToast notifications during mkdir, matching download/upload UX consistency. |
 | 3     | 2026-03-15 | **Phase 3 COMPLETE** — all core web UI features hardware-verified: config dashboard, file manager, WiFi settings, IP mode, themes, mode switch, USB↔Network bat file, button reset. |
+| 5     | 2026-03-15 | **System file filter**: `is_system_entry()` hides OS-generated entries from file listing, search, and ZIP — Windows (`System Volume Information`, `$RECYCLE.BIN`, `$*`), macOS (`._*`, `.Trashes`, `.Spotlight-V100`, `.fseventsd`), and internal temp file (`_dl_tmp.zip`). |
