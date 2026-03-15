@@ -71,12 +71,12 @@ void setup() {
     led_set(0, 0, 80);   // blue = booting
     lcd_begin();
 
-    // 2. Hold BOOT for 3 s at startup → reset WiFi credentials
+    // 2. Hold BOOT for 2 s at startup → reset WiFi credentials
     if (digitalRead(PIN_BUTTON) == LOW) {
-        lcd_splash_msg("Hold BOOT 3s");
+        lcd_splash_msg("Hold BOOT 2s");
         uint32_t t0 = millis();
         while (digitalRead(PIN_BUTTON) == LOW) {
-            if (millis() - t0 > 3000) {
+            if (millis() - t0 > 2000) {
                 lcd_splash_msg("WiFi reset!");
                 delay(800);
                 wifi_reset_credentials();   // clears NVS and restarts
@@ -199,8 +199,8 @@ void loop() {
     if (digitalRead(PIN_BUTTON) == LOW) {
         uint32_t t0 = millis();
         while (digitalRead(PIN_BUTTON) == LOW) {
-            // Fire WiFi reset immediately at 3 s — no need to release first.
-            if (millis() - t0 >= 3000) {
+            // Fire WiFi reset immediately at 2 s — no need to release first.
+            if (millis() - t0 >= 2000) {
                 lcd_splash_msg("WiFi reset!");
                 delay(800);
                 wifi_reset_credentials();   // clears NVS and restarts — never returns
