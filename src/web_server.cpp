@@ -262,8 +262,9 @@ var r=await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'applicat
 var d=await r.json();if(d.ok){if(g_sm)searchAll();else loadDir(cp);}else alert('Rename failed');}
 async function mkD(){var n=prompt('Folder name:');if(!n)return;
 var fp=(cp==='/'?'':cp)+'/'+n;
+setBusy(true,'\uD83D\uDCC1 Creating \u201C'+n+'\u201D\u2026');
 var r=await fetch('/api/mkdir',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+encodeURIComponent(fp)});
-var d=await r.json();if(d.ok)loadDir(cp);}
+var d=await r.json();setBusy(false);if(d.ok){showToast('\u2713 Folder created');loadDir(cp);}else alert('mkdir failed');}
 function updSel(){var all=document.querySelectorAll('.item-chk');var chk=document.querySelectorAll('.item-chk:checked');
 document.getElementById('chkAll').checked=all.length>0&&chk.length===all.length;
 document.getElementById('chkAll').indeterminate=chk.length>0&&chk.length<all.length;
@@ -697,7 +698,17 @@ static void zip_collect(const String& sdp, const String& pre) {
     File f = dir.openNextFile();
     while (f) {
         yield();
-        String fn = f.name();
+        // ESP32 Core 2.x openNextFile().name() returns basename only (no directory
+        // prefix). Build the absolute path explicitly from the parent directory path.
+        const char* raw = f.name();
+        String fn;
+        if (raw && raw[0] == '/') {
+            fn = String(raw);  // already absolute
+        } else {
+            fn = sdp;
+            if (!fn.endsWith("/")) fn += '/';
+            fn += raw;
+        }
         int sl = fn.lastIndexOf('/');
         String base = sl >= 0 ? fn.substring(sl + 1) : fn;
         // Skip the temp file itself if it lands in the listing
@@ -1004,7 +1015,7 @@ void web_server_loop() {
     // Async WiFi scan — triggered from main loop so it never blocks a handler.
     // g_scan_trigger_ts = 0 on startup → first call triggers scan immediately.
     if (WiFi.scanComplete() != WIFI_SCAN_RUNNING &&
-        millis() - g_scan_trigger_ts > 30000UL) {
+        millis() - g_scan_trigger_ts > 10000UL) {
         WiFi.scanNetworks(true);
         g_scan_trigger_ts = millis();
     }
