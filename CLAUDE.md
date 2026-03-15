@@ -75,7 +75,7 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 | Purpose         | Library                      | Notes                              |
 |-----------------|------------------------------|------------------------------------|
 | USB MSC         | `USBMSC.h` (arduino-esp32)   | Built into Arduino Core 2.x        |
-| HTTPS Server    | fhessel/esp32_https_server   | Port 443 + port 80 redirect; self-signed cert |
+| HTTP Server     | mathieucarbou/ESPAsyncWebServer | Port 80, plain HTTP, async, no TLS         |
 | Telegram Bot    | AsyncTelegram2 (cotestatnt)  | Non-blocking, SSL, inline keyboards |
 | HTTP Downloader | HTTPClient (built-in)        | Stream-based chunked writes to SD  |
 | LCD Driver      | TFT_eSPI (Bodmer)            | ST7735 config, fast SPI            |
@@ -120,7 +120,7 @@ USB Server/
 │   ├── storage.cpp / .h      # SD card mount/unmount, stats, path helpers
 │   ├── usb_drive.cpp / .h    # TinyUSB MSC setup and callbacks
 │   ├── wifi_manager.cpp / .h # WiFi connect, AP fallback, captive portal, mDNS
-│   ├── web_server.cpp / .h   # HTTPS server (fhessel) — all routes on port 443, port 80 redirect
+│   ├── web_server.cpp / .h   # HTTP server (ESPAsyncWebServer) — all routes on port 80
 │   ├── downloader.cpp / .h   # HTTPClient + FreeRTOS download queue
 │   ├── telegram_bot.cpp / .h # AsyncTelegram2 bot integration
 │   ├── config.cpp / .h       # NVS Preferences read/write, defaults
@@ -174,7 +174,7 @@ USB Server/
 | Auto-AP fallback            | `wifi_manager`        | [ ] Todo |
 | File type icons on LCD      | `lcd`                 | [ ] Todo |
 | Download history log        | `downloader`          | [ ] Todo |
-| HTTPS web UI (self-signed)  | `web_server`          | [x] Done — fhessel, port 443, port 80 redirect |
+| HTTP web UI                 | `web_server`          | [x] Done — ESPAsyncWebServer, port 80, plain HTTP |
 
 ---
 
@@ -193,9 +193,9 @@ USB Server/
 - [x] LCD reflects active mode: lcd_show_usb_mode() / lcd_show_status()
 
 ### Phase 3 — Config Web UI `[~]` Partially hardware verified
-- [x] HTTPS config dashboard at `https://[ip]/` (self-signed cert, CN=usbdrive.local) — works in both STA and AP modes
-  - Port 443: all routes (fhessel/esp32_https_server)
-  - Port 80: HTTP→HTTPS redirect (captive portal NCSI passthrough in AP mode)
+- [x] HTTP config dashboard at `http://[ip]/` — works in both STA and AP modes
+  - Port 80: all routes (mathieucarbou/ESPAsyncWebServer, fully async)
+  - Captive portal NCSI passthrough in AP mode (connecttest.txt handler)
   - Status card: mode, WiFi, IP, storage
   - Soft mode switch (no button needed)
   - WiFi settings: scan (refreshes every 30 s, preserves selection) + save + restart
@@ -279,3 +279,18 @@ USB Server/
 | 3     | 2026-03-14 | Simplified bat file: removed mshta Shell Eject (no timing improvement). Bat now writes magic-bytes file only; relies on on_write detection + SCSI eject fallback. |
 | 3     | 2026-03-14 | HTTPS migration: replaced Arduino WebServer with fhessel/esp32_https_server. All routes migrated to port 443 (self-signed RSA-2048 cert, CN=usbdrive.local, 2 yr). Port 80 issues HTTP→HTTPS redirect; AP mode passes NCSI connecttest.txt through. Upload changed to raw binary body + path query param (no multipart). File manager download now works in Chrome (was blocked as insecure HTTP download). Patched HTTPConnection.hpp in library to replace missing hwcrypto/sha.h with inline mbedTLS shim. Build: RAM 22.9%, Flash 30.9%. |
 | —     | 2026-03-14 | GitHub repo created: https://github.com/mhmd2520/t-dongle-s3-usb-server. Tagged v0.1.0 as stable baseline. |
+| 3     | 2026-03-14 | ZIP CRC fix: replaced custom 16-entry nibble-table CRC32 with `crc32_le()` from `rom/crc.h` (ESP32 ROM, definitively correct). Both CRC-precompute pass and streaming pass now use exact `e.size` byte-count limits — eliminates CRC/size mismatch in ZIP local headers. |
+| 3     | 2026-03-14 | SSL partial-write fix: `res_write_all()` retries up to 50× with delay(5) on n==0 (mbedTLS would-block) instead of breaking immediately — prevents silent 306-byte truncated downloads. |
+| 3     | 2026-03-14 | ECDSA P-256 cert: replaced RSA-2048 cert (791B+1217B) with ECDSA P-256 (395B+121B) for ~10× faster TLS handshakes. **REVERTED** — fhessel `setupCert()` hardcodes `SSL_CTX_use_RSAPrivateKey_ASN1()` which rejects EC keys silently; server never starts. Restored RSA-2048 cert. |
+| 3     | 2026-03-14 | Chrome download fix: `dlBlob()` uses fetch()+URL.createObjectURL(blob) so Chrome never triggers "Check internet connection" block (self-signed HTTPS in AP mode). |
+| 3     | 2026-03-14 | Concurrent-request crash fix: `BusyGuard` RAII sets `s_busy` flag during download/zip/upload. Second heavy request returns HTTP 503 `{"error":"busy","op":"..."}` immediately. fhessel confirmed single-threaded cooperative loop (no FreeRTOS tasks per connection) — shared `s_dl_buf`/`s_zip_entries` statics are protected. |
+| 3     | 2026-03-14 | Activity indicator: fixed-position toast in file manager shows current op (⬇ Downloading / ⏳ Preparing ZIP / ⬆ Uploading). Back/Forward nav buttons locked (`navLock`) during active fetch to prevent accidental cancellation. 503-busy alert shown if server rejects request. |
+| 3     | 2026-03-14 | Per-file download button: explicit ⬇ button added to every file row (rename ✏ / download ⬇ / delete 🗑), in addition to filename-click download link. |
+| 3     | 2026-03-14 | API batching: `/api/init` combined endpoint returns status + WiFi scan HTML in one JSON response. Root dashboard first-load uses `/api/init` (one TLS handshake vs two). Periodic refresh keeps `/api/status` and `/api/scan` separate. Build: RAM 22.9%, Flash 31.0%. |
+| 3     | 2026-03-14 | Bug fix: ECDSA cert caused server to be completely unreachable. Root cause: `HTTPSServer::setupCert()` in fhessel calls `SSL_CTX_use_RSAPrivateKey_ASN1()` — rejects EC private keys silently, `g_https.start()` returns 0, no socket is bound. Reverted to RSA-2048. |
+| 3     | 2026-03-14 | Bug fix: async WiFi scan. `WiFi.scanNetworks()` was called synchronously (1-3 s block) inside request handlers — blocked TLS handshakes → 9/10 connections failed. Fixed: `web_server_loop()` triggers `WiFi.scanNetworks(true)` (async) every 60 s; `get_networks_html()` reads `WiFi.scanComplete()` — never blocks. |
+| 3     | 2026-03-14 | Bug fix: FILEMAN_HTML (16592 B) truncated at TLS record boundary (16384 B). ESP-IDF `SSL_write()` sends one TLS record per call; `res->print()` doesn't retry. Fixed `handle_files_html` and `handle_root` to use `res_write_all()` (retry loop). Added forward declaration. |
+| 3     | 2026-03-15 | **HTTP migration**: replaced fhessel/esp32_https_server with mathieucarbou/ESPAsyncWebServer (plain HTTP port 80). Removed TLS/mbedTLS stack entirely. Result: instant connections (no RSA handshake), RAM 20.9% (was 22.9%), Flash 23.1% (was 31.0%). Removed patch_https_lib.py + extra_scripts. Removed ssl_certs.h dependency. |
+| 3     | 2026-03-15 | **ZIP CRC fix (attempt 4)**: replaced crc32_le() ROM function (calling-convention ambiguity caused wrong CRC-32/BZIP2 variant) with verified pure-software nibble-table CRC-32/ISO-HDLC. Explicit state init (0xFFFFFFFF) and finalize (state ^ 0xFFFFFFFF). Test vector: crc32("123456789") = 0xCBF43926. |
+| 3     | 2026-03-15 | **ZIP PSRAM buffer**: replaced fhessel HTTP streaming with PSRAM buffer approach. ZIP built into heap_caps_malloc(SPIRAM) buffer, sent via AsyncCallbackResponse AwsResponseFiller. 30 s watchdog in web_server_loop() clears stale busy flag on dropped connections. |
+| 3     | 2026-03-15 | **Branch strategy**: created `dev` branch from master HEAD. All future changes go on `dev`; merge to `master` + version tag when verified stable. |
