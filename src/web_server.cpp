@@ -881,6 +881,13 @@ static void handle_upload_body(AsyncWebServerRequest* req,
         int last_slash = path.lastIndexOf('/');
         if (last_slash > 0) mkdirs(path.substring(0, last_slash));
 
+        // Reject uploads declared larger than 2 GB (SD limit is ~32 GB but
+        // prevent trivial disk-exhaustion if client lies about Content-Length)
+        if (total > 2UL * 1024 * 1024 * 1024) {
+            busy_clear();
+            req->_tempObject = nullptr;
+            return;
+        }
         UploadCtx* ctx = new UploadCtx();
         ctx->busy_held = true;
         ctx->file = SD_MMC.open(path, FILE_WRITE);
@@ -919,8 +926,8 @@ static void handle_rename(AsyncWebServerRequest* req) {
 
 // ── Global search ──────────────────────────────────────────────────────────────
 
-static void search_walk(const String& sdp, const String& q, JsonArray arr, int& cnt) {
-    if (cnt >= 200) return;
+static void search_walk(const String& sdp, const String& q, JsonArray arr, int& cnt, int depth = 0) {
+    if (cnt >= 200 || depth > 20) return;  // depth limit prevents stack overflow
     File dir = SD_MMC.open(sdp);
     if (!dir || !dir.isDirectory()) { dir.close(); return; }
     File f = dir.openNextFile();
@@ -940,7 +947,7 @@ static void search_walk(const String& sdp, const String& q, JsonArray arr, int& 
                 if (!f.isDirectory()) obj["size"] = (uint32_t)f.size();
                 cnt++;
             }
-            if (f.isDirectory()) search_walk(fn, q, arr, cnt);
+            if (f.isDirectory()) search_walk(fn, q, arr, cnt, depth + 1);
         }
         f.close();
         f = dir.openNextFile();
@@ -949,16 +956,18 @@ static void search_walk(const String& sdp, const String& q, JsonArray arr, int& 
 }
 
 static void handle_search(AsyncWebServerRequest* req) {
-    if (!storage_is_ready()) { send_json(req, 503, "{\"error\":\"SD not ready\"}"); return; }
+    if (!busy_try("search")) { send_busy(req); return; }
+    if (!storage_is_ready()) { busy_clear(); send_json(req, 503, "{\"error\":\"SD not ready\"}"); return; }
     String q = qparam(req, "q");
     q.toLowerCase();
-    if (q.isEmpty()) { send_json(req, 400, "{\"error\":\"q required\"}"); return; }
+    if (q.isEmpty()) { busy_clear(); send_json(req, 400, "{\"error\":\"q required\"}"); return; }
     JsonDocument doc;
     JsonArray arr = doc["entries"].to<JsonArray>();
     doc["free_gb"]  = storage_free_gb();
     doc["total_gb"] = storage_total_gb();
     int cnt = 0;
     search_walk("/", q, arr, cnt);
+    busy_clear();
     String json;
     serializeJson(doc, json);
     send_json(req, 200, json);

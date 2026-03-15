@@ -209,6 +209,6 @@ void loop() {
         }
         // Only reach here if button released before 2 s → short press → switch mode.
         uint32_t held = millis() - t0;
-        if (held >= 50) switch_mode();
+        if (held >= 200) switch_mode();  // 200 ms min to avoid contact-bounce false trigger
     }
 }
