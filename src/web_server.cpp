@@ -460,7 +460,7 @@ async function applyTheme(i){
   var r=await api('/api/theme',{id:i});
   toast('th-msg',r.ok?'Theme applied!':'Error.',r.ok);
 }
-loadInit();setInterval(load,12000);setInterval(loadNets,5000);
+loadInit();setInterval(load,12000);setInterval(loadNets,30000);
 </script>
 )html";
 
@@ -1043,13 +1043,11 @@ void web_server_begin() {
 }
 
 void web_server_loop() {
-    // Async WiFi scan — STA mode only. Chain-scan: restart as soon as the
-    // previous scan completes (get_networks_html calls scanDelete → idle state).
-    // 2 s guard prevents hammering if scans return immediately with an error.
-    // AP mode excluded: background scanning disconnects AP clients (channel hop).
+    // Async WiFi scan — STA mode only, every 30 s.
+    // AP mode excluded: no background scanning in AP mode.
     if (!wifi_is_ap_mode() &&
         WiFi.scanComplete() != WIFI_SCAN_RUNNING &&
-        millis() - g_scan_trigger_ts > 2000UL) {
+        millis() - g_scan_trigger_ts > 30000UL) {
         WiFi.scanNetworks(true);
         g_scan_trigger_ts = millis();
     }
