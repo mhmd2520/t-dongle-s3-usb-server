@@ -470,11 +470,15 @@ static void handle_root(AsyncWebServerRequest* req) {
     Serial.printf("[HTTP] GET / from %s\n", req->client()->remoteIP().toString().c_str());
     String page = PAGE_HTML;
     page.replace("DEVICE_NAME", "'" DEVICE_NAME "'");
-    req->send(200, "text/html", page);
+    AsyncWebServerResponse* r = req->beginResponse(200, "text/html", page);
+    r->addHeader("Cache-Control", "no-store");
+    req->send(r);
 }
 
 static void handle_files_html(AsyncWebServerRequest* req) {
-    req->send(200, "text/html", FILEMAN_HTML);
+    AsyncWebServerResponse* r = req->beginResponse(200, "text/html", FILEMAN_HTML);
+    r->addHeader("Cache-Control", "no-store");
+    req->send(r);
 }
 
 static void handle_not_found(AsyncWebServerRequest* req) {
