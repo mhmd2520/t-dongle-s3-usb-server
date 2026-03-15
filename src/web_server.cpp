@@ -61,8 +61,13 @@ static uint32_t crc32_feed(uint32_t state, const uint8_t* buf, size_t len) {
 }
 
 // ── Cached WiFi scan (async, never blocks main loop) ──────────────────────────
-// web_server_loop() calls WiFi.scanNetworks(true) every ~30 s.
-// Handlers call get_networks_html() which reads WiFi.scanComplete() — no block.
+// STA mode: web_server_loop() starts a new scan immediately after the previous
+// completes (~2-3 s natural cycle). get_networks_html() reads results and calls
+// scanDelete(); the next loop iteration sees idle state and restarts.
+// AP mode: background scanning DISABLED — WiFi.scanNetworks() causes the radio
+// to hop channels for ~2-3 s, dropping every client associated with the AP.
+// Instead, handle_init/handle_scan trigger one scan on-demand when the browser
+// explicitly requests network data.
 
 static String   g_scan_cache;
 static uint32_t g_scan_ts         = 0;
@@ -446,7 +451,7 @@ async function applyTheme(i){
   var r=await api('/api/theme',{id:i});
   toast('th-msg',r.ok?'Theme applied!':'Error.',r.ok);
 }
-loadInit();setInterval(load,12000);setInterval(loadNets,30000);
+loadInit();setInterval(load,12000);setInterval(loadNets,5000);
 </script>
 )html";
 
@@ -512,6 +517,11 @@ static void handle_status(AsyncWebServerRequest* req) {
 
 // /api/init — status + WiFi scan in one round-trip (saves one HTTP connection)
 static void handle_init(AsyncWebServerRequest* req) {
+    // In AP mode: trigger an on-demand scan when the browser opens the page.
+    // Background scanning is disabled in AP mode (see comment near g_scan_cache).
+    if (wifi_is_ap_mode() && WiFi.scanComplete() == WIFI_SCAN_FAILED) {
+        WiFi.scanNetworks(true);
+    }
     JsonDocument doc;
     fill_status_json(doc);
     doc["scan_html"] = get_networks_html();
@@ -521,6 +531,10 @@ static void handle_init(AsyncWebServerRequest* req) {
 }
 
 static void handle_scan(AsyncWebServerRequest* req) {
+    // In AP mode: trigger a new scan only when idle (results already consumed).
+    if (wifi_is_ap_mode() && WiFi.scanComplete() == WIFI_SCAN_FAILED) {
+        WiFi.scanNetworks(true);
+    }
     req->send(200, "text/html", get_networks_html());
 }
 
@@ -1012,10 +1026,13 @@ void web_server_begin() {
 }
 
 void web_server_loop() {
-    // Async WiFi scan — triggered from main loop so it never blocks a handler.
-    // g_scan_trigger_ts = 0 on startup → first call triggers scan immediately.
-    if (WiFi.scanComplete() != WIFI_SCAN_RUNNING &&
-        millis() - g_scan_trigger_ts > 10000UL) {
+    // Async WiFi scan — STA mode only. Chain-scan: restart as soon as the
+    // previous scan completes (get_networks_html calls scanDelete → idle state).
+    // 2 s guard prevents hammering if scans return immediately with an error.
+    // AP mode excluded: background scanning disconnects AP clients (channel hop).
+    if (!wifi_is_ap_mode() &&
+        WiFi.scanComplete() != WIFI_SCAN_RUNNING &&
+        millis() - g_scan_trigger_ts > 2000UL) {
         WiFi.scanNetworks(true);
         g_scan_trigger_ts = millis();
     }

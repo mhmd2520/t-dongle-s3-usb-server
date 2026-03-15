@@ -198,7 +198,7 @@ USB Server/
   - Captive portal NCSI passthrough in AP mode (connecttest.txt handler)
   - Status card: mode, WiFi, IP, storage
   - Soft mode switch (no button needed)
-  - WiFi settings: scan (refreshes every 30 s, preserves selection) + save + restart
+  - WiFi settings: scan (STA: chain-scans ~2-3 s cycle; AP: on-demand only; JS polls 5 s; preserves selection) + save + restart
   - IP mode: "Automatic" (DHCP) or "Static IP" (IP/Mask/Gateway fields)
   - Theme selector: Dark / Ocean / Retro (live LCD preview)
   - File manager: list, upload (raw binary), download, delete
@@ -299,3 +299,7 @@ USB Server/
 | 3     | 2026-03-15 | **POST params fix (qparam)**: `req->getParam(key)` without `post=true` only searches URL query string, ignoring `application/x-www-form-urlencoded` body. All POST handlers were returning 400 silently: mode switch, WiFi save, theme, delete, rename, mkdir. Fixed: `qparam()` now checks body params first (`getParam(key,true)`), falls back to query string. |
 | 3     | 2026-03-15 | **ZIP 0-byte fix**: `File::seek()` in `FILE_WRITE` mode on ESP32 FatFS does not seek backward — seek-and-patch approach left local headers with size=0/CRC=0, causing 0-byte extracted files. Replaced with two-pass: pass 1 reads each file computing CRC and tracking actual bytes (not `f.size()`); pass 2 writes ZIP with correct headers from the start. Also filters `/_dl_tmp.zip` from zip_collect to prevent self-inclusion. |
 | 3     | 2026-03-15 | **Hardening (codebase review)**: button debounce raised from 50 ms to 200 ms (prevents contact-bounce false triggers); search wrapped in busy flag and depth-limited to 20 levels (prevents parallel SD traversal and stack exhaustion); upload rejects Content-Length > 2 GB at first chunk (prevents disk exhaustion). |
+| 3     | 2026-03-15 | **ZIP absolute path fix**: `openNextFile().name()` on ESP32 Core 2.x returns basename only (no directory prefix). `zip_collect()` now builds absolute path explicitly as `sdp + '/' + raw`, so pass-1 `SD_MMC.open()` succeeds and extracts real content instead of 0-byte entries. |
+| 3     | 2026-03-15 | **WiFi AP accessibility fix**: background `WiFi.scanNetworks(true)` every 10 s was called in AP mode — radio channel-hopping for ~2-3 s per scan dropped all AP clients ~25% of the time. Fixed: background scanning restricted to STA mode only; AP mode triggers one on-demand scan per `/api/init` or `/api/scan` request (only when idle). |
+| 3     | 2026-03-15 | **WiFi scan chain**: STA mode scan interval reduced from 10 s to 2 s minimum gap, creating a natural chain-scan cycle (restart scan immediately after previous completes, ~2-3 s hardware cycle). JS dashboard scan poll reduced 30 s → 5 s to reflect fresher server-side results. |
+| 3     | 2026-03-15 | **New folder toast**: `mkD()` in FILEMAN_HTML now shows `setBusy`/`showToast` notifications around mkdir, matching download folder UX. |
