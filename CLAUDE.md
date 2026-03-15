@@ -29,7 +29,7 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 │   USB DRIVE MODE    │              │    NETWORK / SERVER MODE │
 │                     │              │                          │
 │  TinyUSB MSC active │◄── SWITCH ──►│  WiFi active             │
-│  SD card → PC       │              │  HTTPS Web UI + Download │
+│  SD card → PC       │              │  HTTP Web UI + Download  │
 │  WiFi DISABLED      │              │  USB MSC DISABLED        │
 └─────────────────────┘              └──────────────────────────┘
 ```
@@ -49,10 +49,9 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 │  ┌─────────────────────┐   ┌────────────────────────────────┐  │
 │  │   USB DRIVE MODE    │   │       NETWORK MODE             │  │
 │  │  TinyUSB MSC        │   │  WiFi Stack                    │  │
-│  │  SD card → host     │   │  ├─ HTTPS Web UI (port 443)    │  │
-│  │  (read/write)       │   │  ├─ HTTP→HTTPS redirect (80)   │  │
-│  └─────────────────────┘   │  ├─ Webhook API (/api/download) │  │
-│                             │  ├─ Telegram Bot (HTTPS)       │  │
+│  │  SD card → host     │   │  ├─ HTTP Web UI (port 80)      │  │
+│  │  (read/write)       │   │  ├─ Webhook API (/api/download) │  │
+│  └─────────────────────┘   │  ├─ Telegram Bot (HTTPS)       │  │
 │                             │  └─ mDNS (usbdrive.local)     │  │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │               SHARED STORAGE LAYER                        │  │
@@ -75,7 +74,7 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 | Purpose         | Library                      | Notes                              |
 |-----------------|------------------------------|------------------------------------|
 | USB MSC         | `USBMSC.h` (arduino-esp32)   | Built into Arduino Core 2.x        |
-| HTTP Server     | mathieucarbou/ESPAsyncWebServer | Port 80, plain HTTP, async, no TLS         |
+| HTTP Server     | mathieucarbou/ESPAsyncWebServer | Port 80, plain HTTP, async, no TLS |
 | Telegram Bot    | AsyncTelegram2 (cotestatnt)  | Non-blocking, SSL, inline keyboards |
 | HTTP Downloader | HTTPClient (built-in)        | Stream-based chunked writes to SD  |
 | LCD Driver      | TFT_eSPI (Bodmer)            | ST7735 config, fast SPI            |
@@ -92,11 +91,6 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 This is the platform used by all working LilyGo T-Dongle-S3 projects (official factory
 examples, pjpmarques HelloWorld, JaredReabow 2025). TFT_eSPI works cleanly on this
 platform without any SPI register hacks.
-
-Note: USB MSC (Phase 2) feasibility with espressif32@6.12.0 will be assessed when
-Phase 1 is hardware-verified. If Core 3.x is required for USB MSC, the Adafruit_ST7735
-or Arduino_GFX library will be used instead of TFT_eSPI (they avoid direct SPI register
-access and work on both Core 2.x and 3.x).
 
 ```ini
 [env:t-dongle-s3]
@@ -115,19 +109,14 @@ USB Server/
 ├── CLAUDE.md                 ← this file
 ├── platformio.ini
 ├── src/
-│   ├── main.cpp              # Entry point, mode manager, FreeRTOS tasks
+│   ├── main.cpp              # Entry point, mode manager, button handler
 │   ├── lcd.cpp / lcd.h       # TFT_eSPI wrapper, all screens, progress bar
 │   ├── storage.cpp / .h      # SD card mount/unmount, stats, path helpers
 │   ├── usb_drive.cpp / .h    # TinyUSB MSC setup and callbacks
 │   ├── wifi_manager.cpp / .h # WiFi connect, AP fallback, captive portal, mDNS
 │   ├── web_server.cpp / .h   # HTTP server (ESPAsyncWebServer) — all routes on port 80
-│   ├── downloader.cpp / .h   # HTTPClient + FreeRTOS download queue
-│   ├── telegram_bot.cpp / .h # AsyncTelegram2 bot integration
-│   ├── config.cpp / .h       # NVS Preferences read/write, defaults
+│   ├── config.h              # Pin defs, NVS keys, compile-time constants
 │   └── themes.cpp / .h       # Color palettes, LCD theme apply
-└── data/                     # SPIFFS-hosted web UI (uploaded separately)
-    ├── index.html
-    └── style.css
 ```
 
 ---
@@ -139,9 +128,9 @@ USB Server/
 | Feature                     | Module                | Status   |
 |-----------------------------|-----------------------|----------|
 | USB Mass Storage (Drive Mode) | `usb_drive`         | [x] Hardware verified |
-| HTTPS Config Dashboard      | `web_server`          | [x] Hardware verified |
-| HTTPS File Manager          | `web_server`          | [~] Code written — pending hardware verify |
-| Direct URL download         | `downloader`          | [ ] Todo |
+| HTTP Config Dashboard       | `web_server`          | [x] Hardware verified |
+| HTTP File Manager           | `web_server`          | [x] Hardware verified |
+| Direct URL download         | `downloader`          | [ ] Todo (Phase 4) |
 | LCD UI with progress bar    | `lcd`                 | [x] Done |
 | WiFi connect from web/LCD   | `wifi_manager`        | [x] Done |
 | Captive portal (first boot) | `wifi_manager`        | [x] Done |
@@ -150,7 +139,7 @@ USB Server/
 | USB→Network via bat file    | `main`+`usb_drive`    | [x] Hardware verified (~20 s, Windows FAT32 lazy flush) |
 | mDNS (`usbdrive.local`)     | `wifi_manager`        | [x] Done |
 | Settings persistence (NVS)  | `config`              | [x] Done |
-| Button ≥3s WiFi reset       | `main`                | [x] Hardware verified |
+| Button ≥2s WiFi reset       | `main`                | [x] Hardware verified |
 
 ### Remote & Automation Features
 
@@ -171,7 +160,7 @@ USB Server/
 | Password protection (web)   | `web_server`+`config` | [ ] Todo |
 | Internal temp monitoring    | `main` + `lcd`        | [ ] Todo |
 | SD card stats on LCD        | `storage` + `lcd`     | [x] Done |
-| Auto-AP fallback            | `wifi_manager`        | [ ] Todo |
+| Auto-AP fallback            | `wifi_manager`        | [x] Done |
 | File type icons on LCD      | `lcd`                 | [ ] Todo |
 | Download history log        | `downloader`          | [ ] Todo |
 | HTTP web UI                 | `web_server`          | [x] Done — ESPAsyncWebServer, port 80, plain HTTP |
@@ -192,27 +181,32 @@ USB Server/
 - [x] Mode switching via BOOT button short press → save to NVS → restart
 - [x] LCD reflects active mode: lcd_show_usb_mode() / lcd_show_status()
 
-### Phase 3 — Config Web UI `[~]` Partially hardware verified
+### Phase 3 — Config Web UI `[x]` COMPLETE (hardware verified)
 - [x] HTTP config dashboard at `http://[ip]/` — works in both STA and AP modes
-  - Port 80: all routes (mathieucarbou/ESPAsyncWebServer, fully async)
-  - Captive portal NCSI passthrough in AP mode (connecttest.txt handler)
+  - Port 80: all routes (mathieucarbou/ESPAsyncWebServer, fully async, plain HTTP)
+  - Captive portal: Android 204 + Windows NCSI + iOS redirect in AP mode
   - Status card: mode, WiFi, IP, storage
   - Soft mode switch (no button needed)
-  - WiFi settings: scan (STA: chain-scans ~2-3 s cycle; AP: on-demand only; JS polls 5 s; preserves selection) + save + restart
+  - WiFi settings: manual-only scan (↻ Refresh button, both AP and STA modes) + save + restart
   - IP mode: "Automatic" (DHCP) or "Static IP" (IP/Mask/Gateway fields)
   - Theme selector: Dark / Ocean / Retro (live LCD preview)
-  - File manager: list, upload (raw binary), download, delete
+  - File manager: list, upload (raw binary), download, delete, rename, mkdir, ZIP download, search
 - [x] USB→Network mode switch via bat file — `Switch_to_Network_Mode.bat` on SD root
   - Writes `SWITCH_TO_NETWORK` to `/_switch_network.txt` (~20 s, Windows FAT32 lazy flush)
   - Magic bytes: `on_write` detects `SWITCH_TO_NETWORK` string → immediate switch
   - SCSI eject fallback: checks for `/_switch_network.txt` on remount
-- [x] Button ≥3s in loop → WiFi reset (raised from 2s to prevent accidental resets)
+- [x] Button ≥2s in loop → WiFi reset
 - [x] Themes: 3 palettes (Dark/Ocean/Retro), NVS-saved, live LCD apply — hardware verified
-- [ ] HTTP file manager: list, upload, download, delete files on SD
-- [ ] Direct URL download: submit link → LCD progress bar → file on SD
-- [ ] Download queue: multiple URLs queued, processed sequentially
+- [x] File manager: list, upload (multi-file + folder), download, delete, rename, mkdir
+- [x] ZIP folder download: two-pass via SD temp file (CRC pre-compute + correct headers)
+- [x] File search: recursive depth-limited walk, 200-result cap
+- [x] Browser cache fix: `Cache-Control: no-store` on HTML pages
+- [x] Concurrent request protection: portMUX spinlock + 503 busy response
 
-### Phase 4 — Remote Control `[ ]`
+### Phase 4 — Remote Control & Downloads `[ ]`
+- [ ] Direct URL download: submit link via web UI → LCD progress bar → file on SD
+- [ ] Download queue: multiple URLs queued, processed sequentially (FreeRTOS task)
+- [ ] LCD download queue display: progress bar + current filename
 - [ ] Telegram Bot: `/download <url>` command triggers download, bot replies with status
 - [ ] Webhook: `POST /api/download {"url":"..."}` → 200 OK → queued
 - [x] Captive portal AP on first boot (no saved WiFi creds) — moved to Phase 1
@@ -220,11 +214,15 @@ USB Server/
 - [x] mDNS: device accessible at `http://usbdrive.local` — moved to Phase 1
 
 ### Phase 5 — Polish `[ ]`
-- [~] Themes: 3 palettes (moved to Phase 3) — done
+- [x] Themes: 3 palettes (moved to Phase 3) — done
 - [ ] Auto-pack: `manifest.json` on SD root lists URLs → one-tap sync all
 - [ ] QR code on LCD: encodes web UI URL on boot
-- [ ] Password protection: HTTPS Basic Auth
+- [ ] Password protection: HTTP Basic Auth
 - [ ] Temperature sensor: warn on LCD if chip > 75°C, log to SD
+- [ ] Filter system files (`/_dl_tmp.zip`, `/_switch_network.txt`) from file manager listing
+- [ ] ZIP temp file cleanup: delete `/_dl_tmp.zip` after streaming completes
+- [ ] Sort WiFi scan results by RSSI (strongest first)
+- [ ] Track upload write errors: check `file.write()` return per chunk
 
 ---
 
@@ -245,13 +243,13 @@ USB Server/
 
 ## Verification Checklist (End-to-End)
 
-- [ ] Drive Mode: plug into PC → removable drive appears → copy 1 GB file both directions
-- [ ] Mode switch: press button → WiFi connects in < 5s → LCD shows IP
-- [ ] Web UI: browser to `https://usbdrive.local` (accept self-signed cert) → file list → upload/download/delete
+- [x] Drive Mode: plug into PC → removable drive appears → copy files both directions
+- [x] Mode switch: press button → WiFi connects → LCD shows IP
+- [x] Web UI: browser to `http://usbdrive.local` → file list → upload/download/delete
 - [ ] URL Download: paste link in web UI → LCD shows progress → file on SD
 - [ ] Telegram: send `/download https://example.com/file.zip` → bot confirms → file appears
-- [ ] Webhook: `curl -X POST https://usbdrive.local/api/download -H "Content-Type: application/json" -d '{"url":"..."}'` → 200 OK → file queued
-- [ ] Theme: change theme in web UI → LCD palette updates immediately
+- [ ] Webhook: `curl -X POST http://usbdrive.local/api/download -H "Content-Type: application/json" -d '{"url":"..."}'` → 200 OK → file queued
+- [x] Theme: change theme in web UI → LCD palette updates immediately
 - [ ] Auto-pack: `manifest.json` on SD → tap Sync → all listed URLs download
 - [ ] Temp warning: simulate high temp → LCD warning appears
 
@@ -292,14 +290,14 @@ USB Server/
 | 3     | 2026-03-14 | Bug fix: FILEMAN_HTML (16592 B) truncated at TLS record boundary (16384 B). ESP-IDF `SSL_write()` sends one TLS record per call; `res->print()` doesn't retry. Fixed `handle_files_html` and `handle_root` to use `res_write_all()` (retry loop). Added forward declaration. |
 | 3     | 2026-03-15 | **HTTP migration**: replaced fhessel/esp32_https_server with mathieucarbou/ESPAsyncWebServer (plain HTTP port 80). Removed TLS/mbedTLS stack entirely. Result: instant connections (no RSA handshake), RAM 20.9% (was 22.9%), Flash 23.1% (was 31.0%). Removed patch_https_lib.py + extra_scripts. Removed ssl_certs.h dependency. |
 | 3     | 2026-03-15 | **ZIP CRC fix (attempt 4)**: replaced crc32_le() ROM function (calling-convention ambiguity caused wrong CRC-32/BZIP2 variant) with verified pure-software nibble-table CRC-32/ISO-HDLC. Explicit state init (0xFFFFFFFF) and finalize (state ^ 0xFFFFFFFF). Test vector: crc32("123456789") = 0xCBF43926. |
-| 3     | 2026-03-15 | **ZIP PSRAM buffer**: replaced fhessel HTTP streaming with PSRAM buffer approach. ZIP built into heap_caps_malloc(SPIRAM) buffer, sent via AsyncCallbackResponse AwsResponseFiller. 30 s watchdog in web_server_loop() clears stale busy flag on dropped connections. |
-| 3     | 2026-03-15 | **Branch strategy**: created `dev` branch from master HEAD. All future changes go on `dev`; merge to `master` + version tag when verified stable. |
 | 3     | 2026-03-15 | **ZIP SD temp file**: replaced PSRAM buffer (HTTP 507 — OPI PSRAM not enabled) with SD temp file approach. ZIP assembled to `/_dl_tmp.zip`, streamed via AsyncWebServer File response. No RAM constraint regardless of ZIP size. |
 | 3     | 2026-03-15 | **USB mode revert fix**: added `SD_MMC.end()` + `storage_begin()` remount before `SD_MMC.remove("/_switch_network.txt")` in magic-bytes handler. Without remount, ESP32 FatFS cache doesn't see raw-sector writes from PC; remove() silently failed leaving stale trigger file → every USB Drive boot immediately reverted to Network Mode. |
 | 3     | 2026-03-15 | **POST params fix (qparam)**: `req->getParam(key)` without `post=true` only searches URL query string, ignoring `application/x-www-form-urlencoded` body. All POST handlers were returning 400 silently: mode switch, WiFi save, theme, delete, rename, mkdir. Fixed: `qparam()` now checks body params first (`getParam(key,true)`), falls back to query string. |
 | 3     | 2026-03-15 | **ZIP 0-byte fix**: `File::seek()` in `FILE_WRITE` mode on ESP32 FatFS does not seek backward — seek-and-patch approach left local headers with size=0/CRC=0, causing 0-byte extracted files. Replaced with two-pass: pass 1 reads each file computing CRC and tracking actual bytes (not `f.size()`); pass 2 writes ZIP with correct headers from the start. Also filters `/_dl_tmp.zip` from zip_collect to prevent self-inclusion. |
 | 3     | 2026-03-15 | **Hardening (codebase review)**: button debounce raised from 50 ms to 200 ms (prevents contact-bounce false triggers); search wrapped in busy flag and depth-limited to 20 levels (prevents parallel SD traversal and stack exhaustion); upload rejects Content-Length > 2 GB at first chunk (prevents disk exhaustion). |
 | 3     | 2026-03-15 | **ZIP absolute path fix**: `openNextFile().name()` on ESP32 Core 2.x returns basename only (no directory prefix). `zip_collect()` now builds absolute path explicitly as `sdp + '/' + raw`, so pass-1 `SD_MMC.open()` succeeds and extracts real content instead of 0-byte entries. |
-| 3     | 2026-03-15 | **WiFi AP accessibility fix**: background `WiFi.scanNetworks(true)` every 10 s was called in AP mode — radio channel-hopping for ~2-3 s per scan dropped all AP clients ~25% of the time. Fixed: background scanning restricted to STA mode only; AP mode triggers one on-demand scan per `/api/init` or `/api/scan` request (only when idle). |
-| 3     | 2026-03-15 | **WiFi scan chain**: STA mode scan interval reduced from 10 s to 2 s minimum gap, creating a natural chain-scan cycle (restart scan immediately after previous completes, ~2-3 s hardware cycle). JS dashboard scan poll reduced 30 s → 5 s to reflect fresher server-side results. |
-| 3     | 2026-03-15 | **New folder toast**: `mkD()` in FILEMAN_HTML now shows `setBusy`/`showToast` notifications around mkdir, matching download folder UX. |
+| 3     | 2026-03-15 | **WiFi AP accessibility fix**: background `WiFi.scanNetworks(true)` in AP mode caused radio channel-hopping ~25% drop rate. Removed all background scanning. Both AP and STA modes now scan ONLY when user clicks ↻ Refresh (`/api/scan?start=1`). `handle_init` shows "Click Refresh to scan" placeholder until first manual scan. |
+| 3     | 2026-03-15 | **Browser cache fix**: `Cache-Control: no-store` added to `handle_root` and `handle_files_html` responses. Prevents browsers caching stale/broken state from previous firmware flashes, which caused AP mode to appear broken on non-incognito browsers. |
+| 3     | 2026-03-15 | **Button WiFi reset**: lowered threshold 3000 ms → 2000 ms. LCD message updated to "Hold BOOT 2s". |
+| 3     | 2026-03-15 | **New folder toast**: `mkD()` in FILEMAN_HTML shows setBusy/showToast notifications during mkdir, matching download/upload UX consistency. |
+| 3     | 2026-03-15 | **Phase 3 COMPLETE** — all core web UI features hardware-verified: config dashboard, file manager, WiFi settings, IP mode, themes, mode switch, USB↔Network bat file, button reset. |
