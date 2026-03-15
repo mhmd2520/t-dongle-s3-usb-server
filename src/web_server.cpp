@@ -90,7 +90,12 @@ static String get_networks_html() {
 // ── Helper ─────────────────────────────────────────────────────────────────────
 
 static String qparam(AsyncWebServerRequest* req, const char* key) {
-    return req->hasParam(key) ? req->getParam(key)->value() : String();
+    // Check POST body params first (application/x-www-form-urlencoded),
+    // then fall back to query string. Without post=true, getParam() only
+    // searches query parameters and all POST handlers silently return 400.
+    auto* p = req->getParam(key, true);   // body param
+    if (!p) p = req->getParam(key);       // query param
+    return p ? p->value() : String();
 }
 
 static void send_json(AsyncWebServerRequest* req, int code, const String& json) {
@@ -668,18 +673,21 @@ static void handle_download(AsyncWebServerRequest* req) {
 }
 
 // ── ZIP folder download ───────────────────────────────────────────────────────
-// Two-pass: CRC computed in pass 1 (pure software, no ROM calling-convention
-// ambiguity), ZIP structure built into a PSRAM buffer in pass 2, then sent as
-// one async response. Avoids data-descriptor mode which confuses 7-Zip on
-// binary files containing the PK\x07\x08 signature bytes.
+// Two-pass via SD temp file: pass 1 reads each file to compute CRC and record
+// actual byte count; pass 2 writes the ZIP to /_dl_tmp.zip, streaming headers
+// and data from SD. Avoids data-descriptor mode (confuses 7-Zip on binary files
+// containing the PK\x07\x08 signature) and avoids backward seek in write mode
+// (unreliable on ESP32 FatFS).
 
 struct ZipEntry {
     String   zip_name;
     String   sd_path;
-    uint32_t size;
-    uint32_t crc;
+    uint32_t size;      // actual bytes read in pass 1
+    uint32_t crc;       // CRC-32 computed in pass 1
     uint32_t hdr_offset;
 };
+
+#define ZIP_TMP "/_dl_tmp.zip"
 
 static std::vector<ZipEntry> s_zip_entries;
 
@@ -692,10 +700,11 @@ static void zip_collect(const String& sdp, const String& pre) {
         String fn = f.name();
         int sl = fn.lastIndexOf('/');
         String base = sl >= 0 ? fn.substring(sl + 1) : fn;
-        if (base.length() > 0) {
+        // Skip the temp file itself if it lands in the listing
+        if (base.length() > 0 && fn != ZIP_TMP) {
             String zn = pre.isEmpty() ? base : (pre + "/" + base);
             if (f.isDirectory()) zip_collect(fn, zn);
-            else s_zip_entries.push_back({zn, fn, (uint32_t)f.size(), 0, 0});
+            else s_zip_entries.push_back({zn, fn, 0, 0, 0});
         }
         f.close();
         f = dir.openNextFile();
@@ -703,24 +712,41 @@ static void zip_collect(const String& sdp, const String& pre) {
     dir.close();
 }
 
+// Pass 1: read each file to compute CRC and record exact byte count.
+// Using actual bytes read (not f.size()) avoids header/data mismatch if
+// the FAT directory entry size is stale or wrong.
+static void zip_pass1_crc() {
+    for (auto& e : s_zip_entries) {
+        File f = SD_MMC.open(e.sd_path, FILE_READ);
+        uint32_t state = 0xFFFFFFFF;
+        uint32_t actual = 0;
+        if (f) {
+            int n;
+            while ((n = f.read(s_dl_buf, sizeof(s_dl_buf))) > 0) {
+                state = crc32_feed(state, s_dl_buf, (size_t)n);
+                actual += (uint32_t)n;
+                yield();
+            }
+            f.close();
+        }
+        e.crc  = state ^ 0xFFFFFFFF;
+        e.size = actual;
+    }
+}
 
 // SD temp-file ZIP builder.
 // ZIP is assembled on SD (/_dl_tmp.zip) — no RAM buffer needed.
-// Single-pass: CRC is computed while writing data, then the local header
-// is patched in-place via seek. Eliminates any pass-1/pass-2 data divergence.
 static File g_zw_fd;
 
 static void zw(const void* d, size_t n) { g_zw_fd.write((const uint8_t*)d, n); }
 static void zw16(uint16_t v) { uint8_t b[2]={uint8_t(v),uint8_t(v>>8)}; zw(b,2); }
 static void zw32(uint32_t v) { uint8_t b[4]={uint8_t(v),uint8_t(v>>8),uint8_t(v>>16),uint8_t(v>>24)}; zw(b,4); }
 
-// Local header with placeholder CRC=0 and sizes=0.
-// The CRC/sizes are patched after writing the file data (seek to hdr_off+14).
-static void zw_local_hdr(const String& name) {
+static void zw_local_hdr(const String& name, uint32_t crc, uint32_t sz) {
     uint16_t nl = name.length();
     zw32(0x04034b50); zw16(20); zw16(0x0800);
     zw16(0); zw16(0); zw16(0);
-    zw32(0); zw32(0); zw32(0);   // CRC, comp_sz, uncomp_sz — patched later
+    zw32(crc); zw32(sz); zw32(sz);
     zw16(nl); zw16(0);
     zw(name.c_str(), nl);
 }
@@ -733,8 +759,6 @@ static void zw_central(const ZipEntry& e) {
     zw32(0); zw32(e.hdr_offset);
     zw(e.zip_name.c_str(), nl);
 }
-
-#define ZIP_TMP "/_dl_tmp.zip"
 
 static void handle_download_zip(AsyncWebServerRequest* req) {
     if (!busy_try("zip")) { send_busy(req); return; }
@@ -758,7 +782,10 @@ static void handle_download_zip(AsyncWebServerRequest* req) {
         req->send(404, "text/plain", "Folder is empty or not found"); return;
     }
 
-    // Delete any leftover temp file and open fresh for writing
+    // Pass 1: CRC + actual byte count (reads each file once)
+    zip_pass1_crc();
+
+    // Pass 2: build ZIP on SD temp file
     SD_MMC.remove(ZIP_TMP);
     g_zw_fd = SD_MMC.open(ZIP_TMP, FILE_WRITE);
     if (!g_zw_fd) {
@@ -767,40 +794,23 @@ static void handle_download_zip(AsyncWebServerRequest* req) {
         req->send(500, "text/plain", "Cannot create temp file on SD"); return;
     }
 
-    // Single-pass: write each file's local header (CRC=0 placeholder),
-    // then data (computing CRC on the fly), then seek back to patch the header.
     for (auto& e : s_zip_entries) {
         e.hdr_offset = (uint32_t)g_zw_fd.position();
-        zw_local_hdr(e.zip_name);
+        zw_local_hdr(e.zip_name, e.crc, e.size);
 
-        uint32_t state = 0xFFFFFFFF;
-        uint32_t actual_size = 0;
         File f = SD_MMC.open(e.sd_path, FILE_READ);
         if (f) {
-            while (true) {
-                int n = f.read(s_dl_buf, sizeof(s_dl_buf));
+            uint32_t written = 0;
+            while (written < e.size) {
+                uint32_t chunk = min((uint32_t)sizeof(s_dl_buf), e.size - written);
+                int n = f.read(s_dl_buf, chunk);
                 if (n <= 0) break;
                 zw(s_dl_buf, (size_t)n);
-                state = crc32_feed(state, s_dl_buf, (size_t)n);
-                actual_size += (uint32_t)n;
+                written += (uint32_t)n;
                 yield();
             }
             f.close();
         }
-        e.crc  = state ^ 0xFFFFFFFF;
-        e.size = actual_size;
-
-        // Patch the local header: CRC-32 is at offset 14 from the header start.
-        // Layout: sig(4)+ver(2)+flags(2)+comp(2)+mtime(2)+mdate(2) = 14 bytes.
-        size_t data_end = g_zw_fd.position();
-        g_zw_fd.seek(e.hdr_offset + 14);
-        uint8_t patch[12] = {
-            uint8_t(e.crc),  uint8_t(e.crc>>8),  uint8_t(e.crc>>16),  uint8_t(e.crc>>24),
-            uint8_t(e.size), uint8_t(e.size>>8), uint8_t(e.size>>16), uint8_t(e.size>>24),
-            uint8_t(e.size), uint8_t(e.size>>8), uint8_t(e.size>>16), uint8_t(e.size>>24),
-        };
-        g_zw_fd.write(patch, 12);
-        g_zw_fd.seek(data_end);
     }
 
     uint32_t cd_off = (uint32_t)g_zw_fd.position();
