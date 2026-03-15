@@ -71,12 +71,12 @@ void setup() {
     led_set(0, 0, 80);   // blue = booting
     lcd_begin();
 
-    // 2. Hold BOOT for 3 s at startup → reset WiFi credentials
+    // 2. Hold BOOT for 2 s at startup → reset WiFi credentials
     if (digitalRead(PIN_BUTTON) == LOW) {
-        lcd_splash_msg("Hold BOOT 3s");
+        lcd_splash_msg("Hold BOOT 2s");
         uint32_t t0 = millis();
         while (digitalRead(PIN_BUTTON) == LOW) {
-            if (millis() - t0 > 3000) {
+            if (millis() - t0 > 2000) {
                 lcd_splash_msg("WiFi reset!");
                 delay(800);
                 wifi_reset_credentials();   // clears NVS and restarts
@@ -170,8 +170,11 @@ void loop() {
     // USB Drive Mode: magic-bytes trigger (bat file) → switch to Network Mode immediately.
     if (g_mode == MODE_USB_DRIVE && usb_drive_switch_requested()) {
         usb_drive_end();
-        // Remove trigger file so a subsequent switch back to USB mode does not
-        // immediately revert to Network again (setup() checks for this file).
+        // Remount SD so FatFS cache reflects the raw-sector writes made by the PC.
+        // Without remount, SD_MMC.remove() silently fails (file not in FatFS cache).
+        SD_MMC.end();
+        delay(200);
+        storage_begin();
         SD_MMC.remove("/_switch_network.txt");
         save_mode(MODE_NETWORK);
         lcd_splash_msg("To Network...");
@@ -196,8 +199,8 @@ void loop() {
     if (digitalRead(PIN_BUTTON) == LOW) {
         uint32_t t0 = millis();
         while (digitalRead(PIN_BUTTON) == LOW) {
-            // Fire WiFi reset immediately at 3 s — no need to release first.
-            if (millis() - t0 >= 3000) {
+            // Fire WiFi reset immediately at 2 s — no need to release first.
+            if (millis() - t0 >= 2000) {
                 lcd_splash_msg("WiFi reset!");
                 delay(800);
                 wifi_reset_credentials();   // clears NVS and restarts — never returns
@@ -206,6 +209,6 @@ void loop() {
         }
         // Only reach here if button released before 2 s → short press → switch mode.
         uint32_t held = millis() - t0;
-        if (held >= 50) switch_mode();
+        if (held >= 200) switch_mode();  // 200 ms min to avoid contact-bounce false trigger
     }
 }
