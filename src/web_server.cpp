@@ -723,41 +723,37 @@ static void zip_precompute_crcs() {
     }
 }
 
-// Write helpers for the PSRAM buffer.
-// g_zip_owned is the in-flight ZIP buffer being streamed to the client.
-// It is freed by the AwsResponseFiller when the last chunk is sent.
-// web_server_loop() also watches for >30 s stale busy (dropped connection).
-static uint8_t* g_zip_buf      = nullptr;
-static size_t   g_zip_buf_cap  = 0;
-static size_t   g_zip_buf_pos  = 0;
-static uint8_t* g_zip_owned    = nullptr;
-static size_t   g_zip_owned_sz = 0;
+// Write helpers for the SD temp file ZIP builder.
+// ZIP is assembled on SD (/_ dl_tmp.zip) — no RAM buffer needed.
+static File     g_zw_fd;
+static uint32_t g_zw_off = 0;
 
-static void zb_write(const void* d, size_t n) {
-    if (g_zip_buf && g_zip_buf_pos + n <= g_zip_buf_cap)
-        memcpy(g_zip_buf + g_zip_buf_pos, d, n);
-    g_zip_buf_pos += n;
+static void zw(const void* d, size_t n) {
+    g_zw_fd.write((const uint8_t*)d, n);
+    g_zw_off += n;
 }
-static void zb_u16(uint16_t v) { uint8_t b[2]={uint8_t(v),uint8_t(v>>8)}; zb_write(b,2); }
-static void zb_u32(uint32_t v) { uint8_t b[4]={uint8_t(v),uint8_t(v>>8),uint8_t(v>>16),uint8_t(v>>24)}; zb_write(b,4); }
+static void zw16(uint16_t v) { uint8_t b[2]={uint8_t(v),uint8_t(v>>8)}; zw(b,2); }
+static void zw32(uint32_t v) { uint8_t b[4]={uint8_t(v),uint8_t(v>>8),uint8_t(v>>16),uint8_t(v>>24)}; zw(b,4); }
 
-static void zb_local_hdr(const String& name, uint32_t crc, uint32_t sz) {
+static void zw_local_hdr(const String& name, uint32_t crc, uint32_t sz) {
     uint16_t nl = name.length();
-    zb_u32(0x04034b50); zb_u16(20); zb_u16(0x0800);
-    zb_u16(0); zb_u16(0); zb_u16(0);
-    zb_u32(crc); zb_u32(sz); zb_u32(sz);
-    zb_u16(nl); zb_u16(0);
-    zb_write(name.c_str(), nl);
+    zw32(0x04034b50); zw16(20); zw16(0x0800);
+    zw16(0); zw16(0); zw16(0);
+    zw32(crc); zw32(sz); zw32(sz);
+    zw16(nl); zw16(0);
+    zw(name.c_str(), nl);
 }
-static void zb_central(const ZipEntry& e) {
+static void zw_central(const ZipEntry& e) {
     uint16_t nl = e.zip_name.length();
-    zb_u32(0x02014b50); zb_u16(20); zb_u16(20); zb_u16(0x0800);
-    zb_u16(0); zb_u16(0); zb_u16(0);
-    zb_u32(e.crc); zb_u32(e.size); zb_u32(e.size);
-    zb_u16(nl); zb_u16(0); zb_u16(0); zb_u16(0); zb_u16(0);
-    zb_u32(0); zb_u32(e.hdr_offset);
-    zb_write(e.zip_name.c_str(), nl);
+    zw32(0x02014b50); zw16(20); zw16(20); zw16(0x0800);
+    zw16(0); zw16(0); zw16(0);
+    zw32(e.crc); zw32(e.size); zw32(e.size);
+    zw16(nl); zw16(0); zw16(0); zw16(0); zw16(0);
+    zw32(0); zw32(e.hdr_offset);
+    zw(e.zip_name.c_str(), nl);
 }
+
+#define ZIP_TMP "/_dl_tmp.zip"
 
 static void handle_download_zip(AsyncWebServerRequest* req) {
     if (!busy_try("zip")) { send_busy(req); return; }
@@ -784,33 +780,22 @@ static void handle_download_zip(AsyncWebServerRequest* req) {
     // Pass 1: compute CRCs
     zip_precompute_crcs();
 
-    // Calculate exact ZIP size
-    uint32_t total = 22;  // EOCD
-    for (const auto& e : s_zip_entries) {
-        uint16_t nl = e.zip_name.length();
-        total += 30 + nl + e.size;  // local header + data
-        total += 46 + nl;           // central directory entry
-    }
+    // Delete any leftover temp file
+    SD_MMC.remove(ZIP_TMP);
 
-    // Allocate PSRAM buffer
-    if (g_zip_buf) { heap_caps_free(g_zip_buf); g_zip_buf = nullptr; }
-    g_zip_buf = (uint8_t*)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!g_zip_buf) {
-        // Fallback: try regular heap for small ZIPs
-        g_zip_buf = (uint8_t*)malloc(total);
-    }
-    if (!g_zip_buf) {
+    // Open temp file for writing
+    g_zw_fd = SD_MMC.open(ZIP_TMP, FILE_WRITE);
+    if (!g_zw_fd) {
         busy_clear();
         s_zip_entries.clear();
-        req->send(507, "text/plain", "Not enough memory for ZIP"); return;
+        req->send(500, "text/plain", "Cannot create temp file on SD"); return;
     }
-    g_zip_buf_cap = total;
-    g_zip_buf_pos = 0;
+    g_zw_off = 0;
 
-    // Pass 2: write ZIP structure into PSRAM buffer
+    // Pass 2: write ZIP structure to SD temp file
     for (auto& e : s_zip_entries) {
-        e.hdr_offset = (uint32_t)g_zip_buf_pos;
-        zb_local_hdr(e.zip_name, e.crc, e.size);
+        e.hdr_offset = g_zw_off;
+        zw_local_hdr(e.zip_name, e.crc, e.size);
         File f = SD_MMC.open(e.sd_path, FILE_READ);
         if (f) {
             uint32_t remaining = e.size;
@@ -818,55 +803,41 @@ static void handle_download_zip(AsyncWebServerRequest* req) {
                 uint32_t chunk = min((uint32_t)sizeof(s_dl_buf), remaining);
                 int n = f.read(s_dl_buf, chunk);
                 if (n <= 0) break;
-                zb_write(s_dl_buf, (size_t)n);
+                zw(s_dl_buf, (size_t)n);
                 remaining -= (uint32_t)n;
                 yield();
             }
             f.close();
         }
     }
-    uint32_t cd_off = (uint32_t)g_zip_buf_pos;
-    for (const auto& e : s_zip_entries) zb_central(e);
-    uint32_t cd_sz = (uint32_t)g_zip_buf_pos - cd_off;
-    uint16_t cnt   = (uint16_t)s_zip_entries.size();
-    zb_u32(0x06054b50); zb_u16(0); zb_u16(0);
-    zb_u16(cnt); zb_u16(cnt);
-    zb_u32(cd_sz); zb_u32(cd_off); zb_u16(0);
+    uint32_t cd_off = g_zw_off;
+    for (const auto& e : s_zip_entries) zw_central(e);
+    uint32_t cd_sz  = g_zw_off - cd_off;
+    uint16_t cnt    = (uint16_t)s_zip_entries.size();
+    zw32(0x06054b50); zw16(0); zw16(0);
+    zw16(cnt); zw16(cnt);
+    zw32(cd_sz); zw32(cd_off); zw16(0);
 
-    size_t actual = g_zip_buf_pos;
+    g_zw_fd.close();
     s_zip_entries.clear();
 
     String fname = (path == "/") ? "sd_root" : path.substring(path.lastIndexOf('/') + 1);
     fname += ".zip";
 
-    // Hand the buffer to the global filler state (BusyGuard prevents overlap).
-    if (g_zip_owned) { free(g_zip_owned); }  // clean up any aborted previous
-    g_zip_owned    = g_zip_buf;
-    g_zip_owned_sz = actual;
-    g_zip_buf      = nullptr;
+    // Open temp file for read and stream to client
+    File zf = SD_MMC.open(ZIP_TMP, FILE_READ);
+    if (!zf) {
+        busy_clear();
+        SD_MMC.remove(ZIP_TMP);
+        req->send(500, "text/plain", "Cannot open ZIP temp file"); return;
+    }
 
-    // AwsResponseFiller: (buffer, maxLen, offset) -> bytesWritten
-    // beginResponse(contentType, length, filler) — no status code arg.
-    AsyncWebServerResponse* resp = req->beginResponse(
-        "application/zip", actual,
-        [](uint8_t* dst, size_t maxLen, size_t idx) -> size_t {
-            if (!g_zip_owned || idx >= g_zip_owned_sz) return 0;
-            size_t n = min(maxLen, g_zip_owned_sz - idx);
-            memcpy(dst, g_zip_owned + idx, n);
-            if (idx + n >= g_zip_owned_sz) {
-                free(g_zip_owned);
-                g_zip_owned    = nullptr;
-                g_zip_owned_sz = 0;
-                busy_clear();
-            }
-            return n;
-        });
-    resp->addHeader("Content-Disposition",
-                    ("attachment; filename=\"" + fname + "\"").c_str());
+    AsyncWebServerResponse* resp = req->beginResponse(zf, fname, "application/zip", true);
     resp->addHeader("Cache-Control", "no-cache");
     req->send(resp);
-    // NOTE: busy_clear() is called inside the filler when the last chunk is sent.
-    // For dropped connections, web_server_loop() has a 30 s watchdog.
+    // AsyncWebServer streams the file asynchronously and closes it when done.
+    // Temp file is cleaned up on next ZIP request (SD_MMC.remove above).
+    busy_clear();
 }
 
 // ── Upload (raw binary body, path as query param) ─────────────────────────────
@@ -1035,7 +1006,6 @@ void web_server_loop() {
     if (s_busy) {
         if (s_busy_since == 0) s_busy_since = millis();
         else if (millis() - s_busy_since > 30000UL) {
-            if (g_zip_owned) { free(g_zip_owned); g_zip_owned = nullptr; g_zip_owned_sz = 0; }
             busy_clear();
             s_busy_since = 0;
         }
