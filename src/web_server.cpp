@@ -639,7 +639,25 @@ static void handle_theme(AsyncWebServerRequest* req) {
     send_json(req, 200, "{\"ok\":true}");
 }
 
-// ── File Manager handlers ──────────────────────────────────────────────────────
+// ── File Manager helpers ───────────────────────────────────────────────────────
+
+// Returns true for OS-generated system entries that should be hidden everywhere
+// (listing, search, ZIP) — Windows volume metadata, recycle bin, macOS artifacts,
+// and our own internal temp file.
+static bool is_system_entry(const String& name) {
+    if (name.isEmpty()) return true;
+    // Windows: starts with '$' (e.g. $RECYCLE.BIN) or exact system folder names
+    if (name[0] == '$') return true;
+    if (name.equalsIgnoreCase("System Volume Information")) return true;
+    // macOS: resource forks and spotlight/trash metadata
+    if (name.startsWith("._"))         return true;
+    if (name.equalsIgnoreCase(".Trashes"))        return true;
+    if (name.equalsIgnoreCase(".Spotlight-V100")) return true;
+    if (name.equalsIgnoreCase(".fseventsd"))      return true;
+    // Our own temp file
+    if (name == "_dl_tmp.zip") return true;
+    return false;
+}
 
 static void mkdirs(const String& path) {
     for (int i = 1; i < (int)path.length(); i++) {
@@ -671,7 +689,7 @@ static void handle_list(AsyncWebServerRequest* req) {
         String fullname = entry.name();
         int slash = fullname.lastIndexOf('/');
         String name = slash >= 0 ? fullname.substring(slash + 1) : fullname;
-        if (name.length() > 0) {
+        if (name.length() > 0 && !is_system_entry(name)) {
             JsonObject obj = arr.add<JsonObject>();
             obj["name"] = name;
             obj["dir"]  = entry.isDirectory();
@@ -755,8 +773,8 @@ static void zip_collect(const String& sdp, const String& pre) {
         }
         int sl = fn.lastIndexOf('/');
         String base = sl >= 0 ? fn.substring(sl + 1) : fn;
-        // Skip the temp file itself if it lands in the listing
-        if (base.length() > 0 && fn != ZIP_TMP) {
+        // Skip system entries and our own temp file
+        if (base.length() > 0 && !is_system_entry(base)) {
             String zn = pre.isEmpty() ? base : (pre + "/" + base);
             if (f.isDirectory()) zip_collect(fn, zn);
             else s_zip_entries.push_back({zn, fn, 0, 0, 0});
@@ -991,7 +1009,7 @@ static void search_walk(const String& sdp, const String& q, JsonArray arr, int& 
         String fn = f.name();
         int sl = fn.lastIndexOf('/');
         String base = sl >= 0 ? fn.substring(sl + 1) : fn;
-        if (base.length() > 0) {
+        if (base.length() > 0 && !is_system_entry(base)) {
             String bl = base; bl.toLowerCase();
             if (bl.indexOf(q) >= 0) {
                 JsonObject obj = arr.add<JsonObject>();
