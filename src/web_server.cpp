@@ -703,43 +703,24 @@ static void zip_collect(const String& sdp, const String& pre) {
     dir.close();
 }
 
-static void zip_precompute_crcs() {
-    for (auto& e : s_zip_entries) {
-        File f = SD_MMC.open(e.sd_path, FILE_READ);
-        uint32_t state = 0xFFFFFFFF;
-        if (f) {
-            uint32_t remaining = e.size;
-            while (remaining > 0) {
-                uint32_t chunk = min((uint32_t)sizeof(s_dl_buf), remaining);
-                int n = f.read(s_dl_buf, chunk);
-                if (n <= 0) break;
-                state = crc32_feed(state, s_dl_buf, (size_t)n);
-                remaining -= (uint32_t)n;
-                yield();
-            }
-            f.close();
-        }
-        e.crc = state ^ 0xFFFFFFFF;  // explicit finalize
-    }
-}
 
-// Write helpers for the SD temp file ZIP builder.
-// ZIP is assembled on SD (/_ dl_tmp.zip) — no RAM buffer needed.
-static File     g_zw_fd;
-static uint32_t g_zw_off = 0;
+// SD temp-file ZIP builder.
+// ZIP is assembled on SD (/_dl_tmp.zip) — no RAM buffer needed.
+// Single-pass: CRC is computed while writing data, then the local header
+// is patched in-place via seek. Eliminates any pass-1/pass-2 data divergence.
+static File g_zw_fd;
 
-static void zw(const void* d, size_t n) {
-    g_zw_fd.write((const uint8_t*)d, n);
-    g_zw_off += n;
-}
+static void zw(const void* d, size_t n) { g_zw_fd.write((const uint8_t*)d, n); }
 static void zw16(uint16_t v) { uint8_t b[2]={uint8_t(v),uint8_t(v>>8)}; zw(b,2); }
 static void zw32(uint32_t v) { uint8_t b[4]={uint8_t(v),uint8_t(v>>8),uint8_t(v>>16),uint8_t(v>>24)}; zw(b,4); }
 
-static void zw_local_hdr(const String& name, uint32_t crc, uint32_t sz) {
+// Local header with placeholder CRC=0 and sizes=0.
+// The CRC/sizes are patched after writing the file data (seek to hdr_off+14).
+static void zw_local_hdr(const String& name) {
     uint16_t nl = name.length();
     zw32(0x04034b50); zw16(20); zw16(0x0800);
     zw16(0); zw16(0); zw16(0);
-    zw32(crc); zw32(sz); zw32(sz);
+    zw32(0); zw32(0); zw32(0);   // CRC, comp_sz, uncomp_sz — patched later
     zw16(nl); zw16(0);
     zw(name.c_str(), nl);
 }
@@ -777,42 +758,54 @@ static void handle_download_zip(AsyncWebServerRequest* req) {
         req->send(404, "text/plain", "Folder is empty or not found"); return;
     }
 
-    // Pass 1: compute CRCs
-    zip_precompute_crcs();
-
-    // Delete any leftover temp file
+    // Delete any leftover temp file and open fresh for writing
     SD_MMC.remove(ZIP_TMP);
-
-    // Open temp file for writing
     g_zw_fd = SD_MMC.open(ZIP_TMP, FILE_WRITE);
     if (!g_zw_fd) {
         busy_clear();
         s_zip_entries.clear();
         req->send(500, "text/plain", "Cannot create temp file on SD"); return;
     }
-    g_zw_off = 0;
 
-    // Pass 2: write ZIP structure to SD temp file
+    // Single-pass: write each file's local header (CRC=0 placeholder),
+    // then data (computing CRC on the fly), then seek back to patch the header.
     for (auto& e : s_zip_entries) {
-        e.hdr_offset = g_zw_off;
-        zw_local_hdr(e.zip_name, e.crc, e.size);
+        e.hdr_offset = (uint32_t)g_zw_fd.position();
+        zw_local_hdr(e.zip_name);
+
+        uint32_t state = 0xFFFFFFFF;
+        uint32_t actual_size = 0;
         File f = SD_MMC.open(e.sd_path, FILE_READ);
         if (f) {
-            uint32_t remaining = e.size;
-            while (remaining > 0) {
-                uint32_t chunk = min((uint32_t)sizeof(s_dl_buf), remaining);
-                int n = f.read(s_dl_buf, chunk);
+            while (true) {
+                int n = f.read(s_dl_buf, sizeof(s_dl_buf));
                 if (n <= 0) break;
                 zw(s_dl_buf, (size_t)n);
-                remaining -= (uint32_t)n;
+                state = crc32_feed(state, s_dl_buf, (size_t)n);
+                actual_size += (uint32_t)n;
                 yield();
             }
             f.close();
         }
+        e.crc  = state ^ 0xFFFFFFFF;
+        e.size = actual_size;
+
+        // Patch the local header: CRC-32 is at offset 14 from the header start.
+        // Layout: sig(4)+ver(2)+flags(2)+comp(2)+mtime(2)+mdate(2) = 14 bytes.
+        size_t data_end = g_zw_fd.position();
+        g_zw_fd.seek(e.hdr_offset + 14);
+        uint8_t patch[12] = {
+            uint8_t(e.crc),  uint8_t(e.crc>>8),  uint8_t(e.crc>>16),  uint8_t(e.crc>>24),
+            uint8_t(e.size), uint8_t(e.size>>8), uint8_t(e.size>>16), uint8_t(e.size>>24),
+            uint8_t(e.size), uint8_t(e.size>>8), uint8_t(e.size>>16), uint8_t(e.size>>24),
+        };
+        g_zw_fd.write(patch, 12);
+        g_zw_fd.seek(data_end);
     }
-    uint32_t cd_off = g_zw_off;
+
+    uint32_t cd_off = (uint32_t)g_zw_fd.position();
     for (const auto& e : s_zip_entries) zw_central(e);
-    uint32_t cd_sz  = g_zw_off - cd_off;
+    uint32_t cd_sz  = (uint32_t)g_zw_fd.position() - cd_off;
     uint16_t cnt    = (uint16_t)s_zip_entries.size();
     zw32(0x06054b50); zw16(0); zw16(0);
     zw16(cnt); zw16(cnt);
@@ -824,7 +817,6 @@ static void handle_download_zip(AsyncWebServerRequest* req) {
     String fname = (path == "/") ? "sd_root" : path.substring(path.lastIndexOf('/') + 1);
     fname += ".zip";
 
-    // Open temp file for read and stream to client
     File zf = SD_MMC.open(ZIP_TMP, FILE_READ);
     if (!zf) {
         busy_clear();
@@ -835,8 +827,6 @@ static void handle_download_zip(AsyncWebServerRequest* req) {
     AsyncWebServerResponse* resp = req->beginResponse(zf, fname, "application/zip", true);
     resp->addHeader("Cache-Control", "no-cache");
     req->send(resp);
-    // AsyncWebServer streams the file asynchronously and closes it when done.
-    // Temp file is cleaned up on next ZIP request (SD_MMC.remove above).
     busy_clear();
 }
 

@@ -170,8 +170,11 @@ void loop() {
     // USB Drive Mode: magic-bytes trigger (bat file) → switch to Network Mode immediately.
     if (g_mode == MODE_USB_DRIVE && usb_drive_switch_requested()) {
         usb_drive_end();
-        // Remove trigger file so a subsequent switch back to USB mode does not
-        // immediately revert to Network again (setup() checks for this file).
+        // Remount SD so FatFS cache reflects the raw-sector writes made by the PC.
+        // Without remount, SD_MMC.remove() silently fails (file not in FatFS cache).
+        SD_MMC.end();
+        delay(200);
+        storage_begin();
         SD_MMC.remove("/_switch_network.txt");
         save_mode(MODE_NETWORK);
         lcd_splash_msg("To Network...");
