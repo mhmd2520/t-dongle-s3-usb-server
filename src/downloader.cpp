@@ -178,6 +178,7 @@ void downloader_run() {
     // Pre-flight: SD ready
     if (!storage_is_ready()) {
         snprintf(s_dl_status, sizeof(s_dl_status), "error: SD not ready");
+        s_dl_cancel = false;
         s_dl_active = false;
         return;
     }
@@ -185,6 +186,7 @@ void downloader_run() {
     // Pre-flight: free space (< 1 MB → reject)
     if (storage_free_gb() < 0.000954f) {   // 0.000954 GB ≈ 1 MB
         snprintf(s_dl_status, sizeof(s_dl_status), "error: SD full");
+        s_dl_cancel = false;
         s_dl_active = false;
         return;
     }
