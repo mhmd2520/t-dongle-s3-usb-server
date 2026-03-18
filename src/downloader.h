@@ -17,6 +17,10 @@ const char* downloader_filename();
 // "idle" / "downloading (42%)" / "downloading (142 KB)" / "done" / "error: <reason>"
 const char* downloader_status();
 
+// Cancel an in-progress download. Safe to call from Core 0 handler context.
+// The stream loop will stop, delete the partial file, and set status "cancelled".
+void        downloader_cancel();
+
 // Execute pending download. Must be called from main loop (Core 1) only.
 void        downloader_run();
 

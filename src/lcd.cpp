@@ -21,7 +21,9 @@ static const uint8_t  FTR_Y  = 148;   // footer separator y
 static const uint8_t  FTR_TY = 154;   // footer text centre y
 
 static TFT_eSPI tft;
-static bool     s_layout_drawn = false;   // reset by lcd_invalidate_layout() on mode switch
+static bool     s_layout_drawn  = false;   // reset by lcd_invalidate_layout() on mode switch
+static uint8_t  s_prog_last_pct = 255;     // 255 = not yet drawn; reset by lcd_invalidate_layout()
+static char     s_prog_last_lbl[80] = "";  // cached label for partial-refresh
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -220,34 +222,44 @@ void lcd_show_status(bool wifi_ok, bool ap_mode, const String& ip,
 }
 
 void lcd_show_progress(const String& label, uint8_t percent) {
-    draw_header("Downloading");
-    clear_content();
-
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextSize(1);
-
-    // Label
-    tft.setTextColor(C_TEXT, C_BG);
-    tft.drawString(label, LCD_W / 2, 50);
-
-    // Bar outline
     const uint8_t BAR_X = 10;
     const uint8_t BAR_Y = 70;
     const uint8_t BAR_W = LCD_W - 20;
     const uint8_t BAR_H = 12;
-    tft.drawRect(BAR_X, BAR_Y, BAR_W, BAR_H, C_DIM);
 
-    // Fill
-    if (percent > 0) {
-        uint16_t fill = (uint16_t)(BAR_W * percent / 100);
-        tft.fillRect(BAR_X + 1, BAR_Y + 1, fill, BAR_H - 2, C_BAR);
+    bool label_changed = (strncmp(label.c_str(), s_prog_last_lbl, sizeof(s_prog_last_lbl) - 1) != 0);
+    bool first_draw    = (s_prog_last_pct == 255) || label_changed;
+
+    if (first_draw) {
+        // Full redraw: chrome + static elements
+        draw_header("Downloading");
+        clear_content();
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextSize(1);
+        tft.setTextColor(C_TEXT, C_BG);
+        tft.drawString(label, LCD_W / 2, 50);
+        tft.drawRect(BAR_X, BAR_Y, BAR_W, BAR_H, C_DIM);
+        strncpy(s_prog_last_lbl, label.c_str(), sizeof(s_prog_last_lbl) - 1);
+        s_prog_last_lbl[sizeof(s_prog_last_lbl) - 1] = '\0';
+        s_prog_last_pct = 255;   // force bar + text update below
     }
 
-    // Percentage
-    char buf[6];
-    snprintf(buf, sizeof(buf), "%d%%", percent);
-    tft.setTextColor(C_TEXT, C_BG);
-    tft.drawString(buf, LCD_W / 2, 95);
+    if (percent != s_prog_last_pct) {
+        // Partial redraw: bar fill + percentage only
+        tft.fillRect(BAR_X + 1, BAR_Y + 1, BAR_W - 2, BAR_H - 2, C_BG);
+        if (percent > 0) {
+            uint16_t fill = (uint16_t)(BAR_W * percent / 100);
+            tft.fillRect(BAR_X + 1, BAR_Y + 1, fill, BAR_H - 2, C_BAR);
+        }
+        char buf[6];
+        snprintf(buf, sizeof(buf), "%d%%", percent);
+        tft.fillRect(0, 87, LCD_W, 13, C_BG);   // clear old percentage text
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextSize(1);
+        tft.setTextColor(C_TEXT, C_BG);
+        tft.drawString(buf, LCD_W / 2, 95);
+        s_prog_last_pct = percent;
+    }
 }
 
 
@@ -284,7 +296,9 @@ void lcd_show_usb_mode(bool sd_ok, float sd_free_gb, float sd_total_gb) {
 }
 
 void lcd_invalidate_layout() {
-    s_layout_drawn = false;
+    s_layout_drawn  = false;
+    s_prog_last_pct = 255;     // force full redraw on next lcd_show_progress()
+    s_prog_last_lbl[0] = '\0';
 }
 
 void lcd_set_backlight(uint8_t brightness) {

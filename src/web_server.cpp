@@ -166,6 +166,7 @@ progress{width:100%;height:6px;margin-top:5px;display:none}.spd{font-size:.75em;
 <div class="dlbar">
   <input class="dlin" type="url" id="dlurl" placeholder="Paste URL to download to SD&#8230;" autocomplete="off">
   <button class="btn c" onclick="dlUrl()">&#8659; URL</button>
+  <button class="btn" id="dlcancel" style="display:none;background:#400;color:#f88" onclick="dlCancel()">&#10005;</button>
 </div>
 <div class="selbar" id="selbar">
   <input type="checkbox" class="chk" id="chkAll" onchange="selAll(this.checked)">
@@ -304,6 +305,7 @@ if(failed){umEl.textContent=failed+' file(s) failed';umEl.className='msg ng';}
 else{umEl.textContent='Done! '+files.length+' file'+(files.length>1?'s':'')+' uploaded';umEl.className='msg ok';}
 setTimeout(function(){umEl.className='msg';},4000);loadDir(cp);}
 var g_dlPoll=null;
+function dlCancelBtn(show){document.getElementById('dlcancel').style.display=show?'':'none';}
 function startDlPoll(){clearInterval(g_dlPoll);g_dlPoll=setInterval(dlPoll,2000);}
 async function dlUrl(){
   var url=document.getElementById('dlurl').value.trim();
@@ -316,27 +318,30 @@ async function dlUrl(){
     if(!r.ok||!d.ok){setBusy(false);navLock(false);alert('Error: '+(d.error||r.status));return;}
     document.getElementById('dlurl').value='';
     showToast('\u2b07 Downloading: '+(d.filename||'file'));
-    startDlPoll();
+    dlCancelBtn(true);startDlPoll();
   }catch(e){setBusy(false);navLock(false);alert('Request failed: '+e);}
 }
 async function dlPoll(){
   try{
     var r=await fetch('/api/dl-status');var d=await r.json();
     if(d.active){
-      var msg='\u2b07 '+(d.filename||'file')+' \u2014 '+d.status;
-      showToast(msg);
+      showToast('\u2b07 '+(d.filename||'file')+' \u2014 '+d.status);
     }else{
-      clearInterval(g_dlPoll);g_dlPoll=null;setBusy(false);navLock(false);
+      clearInterval(g_dlPoll);g_dlPoll=null;dlCancelBtn(false);setBusy(false);navLock(false);
       if(d.status&&d.status!=='idle'){
         var ok=d.status==='done';
-        showToast((ok?'\u2713 Done: ':'\u2717 ')+(d.filename||'')+(ok?'':' \u2014 '+d.status));
+        var cancelled=d.status==='cancelled';
+        showToast(ok?'\u2713 Done: '+(d.filename||''):cancelled?'\u23f9 Cancelled':(d.filename||'')+' \u2014 '+d.status);
         if(ok)setTimeout(function(){loadDir(cp);},1200);
       }
     }
-  }catch(e){clearInterval(g_dlPoll);g_dlPoll=null;setBusy(false);navLock(false);}
+  }catch(e){clearInterval(g_dlPoll);g_dlPoll=null;dlCancelBtn(false);setBusy(false);navLock(false);}
+}
+async function dlCancel(){
+  try{await fetch('/api/dl-cancel',{method:'POST'});showToast('\u23f9 Cancelling\u2026');}catch(e){}
 }
 goTo('/');
-(async function(){try{var r=await fetch('/api/dl-status');var d=await r.json();if(d.active){navLock(true);setBusy(true,'\u2b07 '+(d.filename||'download')+' in progress');startDlPoll();}}catch(e){}})();
+(async function(){try{var r=await fetch('/api/dl-status');var d=await r.json();if(d.active){navLock(true);setBusy(true,'\u2b07 '+(d.filename||'download')+' in progress');dlCancelBtn(true);startDlPoll();}}catch(e){}})();
 </script></body></html>
 )html";
 
@@ -1123,6 +1128,11 @@ static void handle_dl_status(AsyncWebServerRequest* req) {
     send_json(req, 200, json);
 }
 
+static void handle_dl_cancel(AsyncWebServerRequest* req) {
+    downloader_cancel();
+    send_json(req, 200, "{\"ok\":true}");
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 void web_server_begin() {
@@ -1145,6 +1155,7 @@ void web_server_begin() {
     server.on("/api/rename",     HTTP_POST, handle_rename);
     server.on("/api/download",   HTTP_POST, handle_api_download);
     server.on("/api/dl-status",  HTTP_GET,  handle_dl_status);
+    server.on("/api/dl-cancel",  HTTP_POST, handle_dl_cancel);
     // Upload: completion handler + body handler (raw binary, no multipart)
     server.on("/upload", HTTP_POST, handle_upload, nullptr, handle_upload_body);
     server.onNotFound(handle_not_found);

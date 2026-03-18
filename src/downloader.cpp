@@ -8,13 +8,14 @@
 // ── Constants ─────────────────────────────────────────────────────────────────
 #define DL_URL_MAX   512
 #define DL_FNAME_MAX  63
-#define DL_BUF_SIZE 8192
-#define DL_LCD_EVERY 16384   // update LCD every 16 KB
+#define DL_BUF_SIZE 32768    // 32 KB transfer buffer — reduces SD write calls and loop overhead
+#define DL_LCD_EVERY 32768   // update LCD every 32 KB
 
 // ── State (volatile fields are read by Core 0 via API handlers) ───────────────
 static volatile bool  s_dl_pending  = false;   // Core 0 sets, Core 1 clears
 static char           s_dl_url[DL_URL_MAX + 1];
 static volatile bool  s_dl_active   = false;
+static volatile bool  s_dl_cancel   = false;   // Core 0 sets → Core 1 aborts stream loop
 static volatile int   s_dl_progress = 0;       // 0-100 or -1
 static char           s_dl_filename[DL_FNAME_MAX + 1];
 static char           s_dl_status[80];
@@ -125,6 +126,13 @@ bool downloader_is_busy() {
     return s_dl_active || s_dl_pending;
 }
 
+void downloader_cancel() {
+    if (s_dl_active || s_dl_pending) {
+        s_dl_pending = false;   // drop queued-but-not-started download too
+        s_dl_cancel  = true;
+    }
+}
+
 int downloader_progress() {
     return (int)s_dl_progress;
 }
@@ -215,9 +223,13 @@ void downloader_run() {
     WiFiClient* stream = http.getStreamPtr();
     int32_t bytes_recv = 0;
     int32_t last_lcd   = -DL_LCD_EVERY;   // force first update immediately
-    bool write_err = false;
+    bool write_err  = false;
+    bool cancelled  = false;
 
     while (http.connected() || stream->available()) {
+        // Cancel check — set by Core 0 via downloader_cancel()
+        if (s_dl_cancel) { cancelled = true; break; }
+
         int avail = stream->available();
         if (avail > 0) {
             int chunk = (avail > DL_BUF_SIZE) ? DL_BUF_SIZE : avail;
@@ -254,14 +266,27 @@ void downloader_run() {
         } else {
             // No bytes available yet — check if we're done
             if (known_size && bytes_recv >= (int32_t)content_len) break;
-            delay(1);
+            // No delay — yield() alone is sufficient to feed the watchdog
         }
         yield();   // feed watchdog, let Core 0 handle HTTP requests
     }
     outf.close();
 
+    // Limit TLS shutdown wait to 1 s — prevents task watchdog reset on slow servers.
+    if (sc) sc->setTimeout(1000);
     http.end();
     if (sc) { delete sc; sc = nullptr; }
+
+    // ── Cancelled ─────────────────────────────────────────────────────────────
+    if (cancelled) {
+        SD_MMC.remove(sdpath.c_str());
+        s_dl_cancel = false;
+        snprintf(s_dl_status, sizeof(s_dl_status), "cancelled");
+        s_dl_active = false;
+        lcd_invalidate_layout();
+        Serial.printf("[DL] Cancelled: /%s\n", s_dl_filename);
+        return;
+    }
 
     // ── Error: SD write failure ───────────────────────────────────────────────
     if (write_err) {
