@@ -4,6 +4,7 @@
 #include "storage.h"
 #include "themes.h"
 #include "lcd.h"
+#include "downloader.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -140,6 +141,9 @@ progress{width:100%;height:6px;margin-top:5px;display:none}.spd{font-size:.75em;
 .selbar{display:none;gap:6px;align-items:center;margin-bottom:8px;font-size:.8em;color:#fa0;flex-wrap:wrap}
 .chk{accent-color:#0cf;cursor:pointer;flex-shrink:0}
 .srhdr{font-size:.78em;color:#fa0;padding:4px 0 6px;display:none}
+.dlbar{display:flex;gap:5px;margin-bottom:8px;align-items:center}
+.dlin{flex:1;min-width:0;padding:5px 8px;background:#1c1c1c;border:1px solid #2a2a2a;border-radius:5px;color:#eee;font-size:.78em}
+.dlin::placeholder{color:#444}
 </style></head><body>
 <div class="toast" id="toast"></div>
 <h1>&#128190; File Manager <a href="/">&#8592; Config</a></h1>
@@ -158,6 +162,10 @@ progress{width:100%;height:6px;margin-top:5px;display:none}.spd{font-size:.75em;
     <button class="btn g" id="srchX" onclick="clrSrch()" style="display:none;padding:5px 7px" title="Clear search">&#10005;</button>
   </div>
   <span class="stor" id="stor"></span>
+</div>
+<div class="dlbar">
+  <input class="dlin" type="url" id="dlurl" placeholder="Paste URL to download to SD&#8230;" autocomplete="off">
+  <button class="btn c" onclick="dlUrl()">&#8659; URL</button>
 </div>
 <div class="selbar" id="selbar">
   <input type="checkbox" class="chk" id="chkAll" onchange="selAll(this.checked)">
@@ -295,7 +303,40 @@ pgEl.style.display='none';spdEl.textContent='';setBusy(false);navLock(false);
 if(failed){umEl.textContent=failed+' file(s) failed';umEl.className='msg ng';}
 else{umEl.textContent='Done! '+files.length+' file'+(files.length>1?'s':'')+' uploaded';umEl.className='msg ok';}
 setTimeout(function(){umEl.className='msg';},4000);loadDir(cp);}
+var g_dlPoll=null;
+function startDlPoll(){clearInterval(g_dlPoll);g_dlPoll=setInterval(dlPoll,2000);}
+async function dlUrl(){
+  var url=document.getElementById('dlurl').value.trim();
+  if(!url)return;
+  if(!url.startsWith('http://')&&!url.startsWith('https://')){alert('URL must start with http:// or https://');return;}
+  navLock(true);setBusy(true,'\u2b07 Queuing\u2026');
+  try{
+    var r=await fetch('/api/download',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'url='+encodeURIComponent(url)});
+    var d=await r.json();
+    if(!r.ok||!d.ok){setBusy(false);navLock(false);alert('Error: '+(d.error||r.status));return;}
+    document.getElementById('dlurl').value='';
+    showToast('\u2b07 Downloading: '+(d.filename||'file'));
+    startDlPoll();
+  }catch(e){setBusy(false);navLock(false);alert('Request failed: '+e);}
+}
+async function dlPoll(){
+  try{
+    var r=await fetch('/api/dl-status');var d=await r.json();
+    if(d.active){
+      var msg='\u2b07 '+(d.filename||'file')+' \u2014 '+d.status;
+      showToast(msg);
+    }else{
+      clearInterval(g_dlPoll);g_dlPoll=null;setBusy(false);navLock(false);
+      if(d.status&&d.status!=='idle'){
+        var ok=d.status==='done';
+        showToast((ok?'\u2713 Done: ':'\u2717 ')+(d.filename||'')+(ok?'':' \u2014 '+d.status));
+        if(ok)setTimeout(function(){loadDir(cp);},1200);
+      }
+    }
+  }catch(e){clearInterval(g_dlPoll);g_dlPoll=null;setBusy(false);navLock(false);}
+}
 goTo('/');
+(async function(){try{var r=await fetch('/api/dl-status');var d=await r.json();if(d.active){navLock(true);setBusy(true,'\u2b07 '+(d.filename||'download')+' in progress');startDlPoll();}}catch(e){}})();
 </script></body></html>
 )html";
 
@@ -1046,6 +1087,42 @@ static void handle_search(AsyncWebServerRequest* req) {
     send_json(req, 200, json);
 }
 
+// ── URL downloader routes ─────────────────────────────────────────────────────
+
+static void handle_api_download(AsyncWebServerRequest* req) {
+    String url = qparam(req, "url");
+    if (url.isEmpty()) {
+        send_json(req, 400, "{\"ok\":false,\"error\":\"url required\"}");
+        return;
+    }
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+        send_json(req, 400, "{\"ok\":false,\"error\":\"url must start with http or https\"}");
+        return;
+    }
+    if (!storage_is_ready()) {
+        send_json(req, 503, "{\"ok\":false,\"error\":\"SD not ready\"}");
+        return;
+    }
+    if (!downloader_queue(url.c_str())) {
+        send_json(req, 503, "{\"ok\":false,\"error\":\"already downloading\"}");
+        return;
+    }
+    String fn = downloader_quick_filename(url.c_str());
+    String resp = "{\"ok\":true,\"status\":\"queued\",\"filename\":\"" + fn + "\"}";
+    send_json(req, 200, resp);
+}
+
+static void handle_dl_status(AsyncWebServerRequest* req) {
+    JsonDocument doc;
+    doc["active"]   = downloader_is_busy();
+    doc["progress"] = downloader_progress();
+    doc["filename"] = downloader_filename();
+    doc["status"]   = downloader_status();
+    String json;
+    serializeJson(doc, json);
+    send_json(req, 200, json);
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 void web_server_begin() {
@@ -1066,6 +1143,8 @@ void web_server_begin() {
     server.on("/api/delete",     HTTP_POST, handle_delete);
     server.on("/api/mkdir",      HTTP_POST, handle_mkdir);
     server.on("/api/rename",     HTTP_POST, handle_rename);
+    server.on("/api/download",   HTTP_POST, handle_api_download);
+    server.on("/api/dl-status",  HTTP_GET,  handle_dl_status);
     // Upload: completion handler + body handler (raw binary, no multipart)
     server.on("/upload", HTTP_POST, handle_upload, nullptr, handle_upload_body);
     server.onNotFound(handle_not_found);
