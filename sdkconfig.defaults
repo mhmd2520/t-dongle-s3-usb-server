@@ -1,0 +1,26 @@
+# TCP receive window / send buffer tuning for faster HTTP downloads.
+#
+# NOTE — INEFFECTIVE with espressif32@6.12.0 (prebuilt liblwip.a)
+# ─────────────────────────────────────────────────────────────────
+# espressif32@6.12.0 ships a prebuilt liblwip.a compiled with the Espressif
+# Arduino Core.  CONFIG_LWIP_* settings in sdkconfig.defaults are baked into
+# that binary at compile time; they CANNOT be changed at link/runtime for this
+# platform.  TCP_WND stays at the IDF default (5760 bytes) regardless of what
+# is written here.
+#
+# The SO_RCVBUF setsockopt() call in downloader.cpp is also a no-op for the
+# same reason — lwIP's pcb->rcv_wnd cannot be expanded past the compiled-in
+# TCP_WND value.
+#
+# To get larger TCP windows (and faster downloads), a rebuild with a custom
+# ESP-IDF or a switch to pioarduino (which allows SDK rebuilds) would be
+# required.  This is tracked as a future improvement.
+#
+# Theoretical throughput at 50 ms RTT if these values were effective:
+#   5760  / 0.05 = ~115 KB/s  (default)
+#   65535 / 0.05 = ~1.3 MB/s  (if applied)
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64

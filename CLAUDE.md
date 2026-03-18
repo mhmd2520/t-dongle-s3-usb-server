@@ -115,6 +115,8 @@ USB Server/
 │   ├── usb_drive.cpp / .h    # TinyUSB MSC setup and callbacks
 │   ├── wifi_manager.cpp / .h # WiFi connect, AP fallback, captive portal, mDNS
 │   ├── web_server.cpp / .h   # HTTP server (ESPAsyncWebServer) — all routes on port 80
+│   ├── downloader.cpp / .h   # URL downloader — state machine, HTTPClient stream, LCD progress
+│   ├── actlog.cpp / .h       # Activity log — 50-entry ring buffer, GET /api/log
 │   ├── config.h              # Pin defs, NVS keys, compile-time constants
 │   └── themes.cpp / .h       # Color palettes, LCD theme apply
 ```
@@ -130,7 +132,7 @@ USB Server/
 | USB Mass Storage (Drive Mode) | `usb_drive`         | [x] Hardware verified |
 | HTTP Config Dashboard       | `web_server`          | [x] Hardware verified |
 | HTTP File Manager           | `web_server`          | [x] Hardware verified |
-| Direct URL download         | `downloader`          | [ ] Todo (Phase 4) |
+| Direct URL download         | `downloader`          | [x] Done — feat/url-download, v0.4.0 |
 | LCD UI with progress bar    | `lcd`                 | [x] Done |
 | WiFi connect from web/LCD   | `wifi_manager`        | [x] Done |
 | Captive portal (first boot) | `wifi_manager`        | [x] Done |
@@ -162,7 +164,7 @@ USB Server/
 | SD card stats on LCD        | `storage` + `lcd`     | [x] Done |
 | Auto-AP fallback            | `wifi_manager`        | [x] Done |
 | File type icons on LCD      | `lcd`                 | [ ] Todo |
-| Download history log        | `downloader`          | [ ] Todo |
+| Download history log        | `downloader`          | [x] Done — actlog 50-entry ring buffer, GET /api/log |
 | HTTP web UI                 | `web_server`          | [x] Done — ESPAsyncWebServer, port 80, plain HTTP |
 
 ---
@@ -203,8 +205,8 @@ USB Server/
 - [x] Browser cache fix: `Cache-Control: no-store` on HTML pages
 - [x] Concurrent request protection: portMUX spinlock + 503 busy response
 
-### Phase 4 — Remote Control & Downloads `[ ]`
-- [ ] Direct URL download: submit link via web UI → LCD progress bar → file on SD
+### Phase 4 — Remote Control & Downloads `[~]` (partial)
+- [x] Direct URL download: submit link via web UI → LCD progress bar → file on SD
 - [ ] Download queue: multiple URLs queued, processed sequentially (FreeRTOS task)
 - [ ] LCD download queue display: progress bar + current filename
 - [ ] Telegram Bot: `/download <url>` command triggers download, bot replies with status
@@ -246,7 +248,7 @@ USB Server/
 - [x] Drive Mode: plug into PC → removable drive appears → copy files both directions
 - [x] Mode switch: press button → WiFi connects → LCD shows IP
 - [x] Web UI: browser to `http://usbdrive.local` → file list → upload/download/delete
-- [ ] URL Download: paste link in web UI → LCD shows progress → file on SD
+- [x] URL Download: paste link in web UI → LCD shows progress → file on SD
 - [ ] Telegram: send `/download https://example.com/file.zip` → bot confirms → file appears
 - [ ] Webhook: `curl -X POST http://usbdrive.local/api/download -H "Content-Type: application/json" -d '{"url":"..."}'` → 200 OK → file queued
 - [x] Theme: change theme in web UI → LCD palette updates immediately
@@ -302,3 +304,4 @@ USB Server/
 | 3     | 2026-03-15 | **New folder toast**: `mkD()` in FILEMAN_HTML shows setBusy/showToast notifications during mkdir, matching download/upload UX consistency. |
 | 3     | 2026-03-15 | **Phase 3 COMPLETE** — all core web UI features hardware-verified: config dashboard, file manager, WiFi settings, IP mode, themes, mode switch, USB↔Network bat file, button reset. |
 | 5     | 2026-03-15 | **System file filter**: `is_system_entry()` hides OS-generated entries from file listing, search, and ZIP — Windows (`System Volume Information`, `$RECYCLE.BIN`, `$*`), macOS (`._*`, `.Trashes`, `.Spotlight-V100`, `.fseventsd`), and internal temp file (`_dl_tmp.zip`). |
+| 4     | 2026-03-19 | **Direct URL download complete**: POST `/api/download`, streaming to SD via HTTPClient, LCD progress bar (partial refresh — speed/size/ETA rows update without full-screen blink), live speed (KB/s)/size/ETA on LCD and web toast, conflict modal (Replace/Skip/Cancel) with .bak backup/restore pattern, cancel button (`POST /api/dl-cancel`), activity log — `actlog.h/cpp` 50-entry ring buffer, `GET /api/log`. On-load check restores poll state after page reload mid-download. `SO_RCVBUF` setsockopt attempted for TCP window expansion but is a no-op against prebuilt `liblwip.a` in espressif32@6.12.0 (TCP_WND=5760 hardcoded); documented in sdkconfig.defaults. Bug fix: added `s_dl_cancel = false` to early-exit paths (SD not ready / SD full) to prevent stale cancel flag poisoning the next download. |

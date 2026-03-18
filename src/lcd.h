@@ -18,9 +18,13 @@ void lcd_show_status(bool wifi_ok, bool ap_mode, const String& ip,
                      bool sd_ok, float sd_free_gb, float sd_total_gb);
 
 // Full-screen progress bar used during file operations (Phase 3+).
-//   label   – short description, e.g. "Downloading..."
-//   percent – 0–100
-void lcd_show_progress(const String& label, uint8_t percent);
+//   label       – filename / short description
+//   percent     – 0–100
+//   speed_kbps  – current KB/s; -1 = not yet sampled
+//   bytes_recv  – bytes received so far (for size display)
+//   content_len – total bytes from Content-Length; -1 if unknown
+void lcd_show_progress(const String& label, uint8_t percent,
+                       int speed_kbps = -1, int32_t bytes_recv = 0, int content_len = -1);
 
 // USB Drive Mode status screen — call after usb_drive_begin().
 //   sd_ok        — true if SD card is mounted and passed to MSC

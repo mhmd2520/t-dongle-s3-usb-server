@@ -8,6 +8,7 @@
 #include "wifi_manager.h"
 #include "usb_drive.h"
 #include "web_server.h"
+#include "downloader.h"
 #include <SD_MMC.h>
 
 // ── Global state ──────────────────────────────────────────────────────────────
@@ -163,8 +164,13 @@ void loop() {
     if (g_mode == MODE_NETWORK) {
         wifi_portal_loop();    // DNS captive-portal redirect in AP mode (no-op in STA)
         web_server_loop();
+        downloader_run();      // execute pending URL download (blocks loop during transfer)
         if (millis() - g_last_refresh > 15000) {
-            refresh_status();
+            if (!downloader_is_busy()) {
+                refresh_status();
+            } else {
+                g_last_refresh = millis();   // defer — downloader is using LCD
+            }
         }
     }
     // USB Drive Mode: magic-bytes trigger (bat file) → switch to Network Mode immediately.
