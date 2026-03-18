@@ -1,0 +1,10 @@
+# Increase lwIP TCP receive window from the default 5744 bytes to 65535.
+# At a typical 50 ms internet RTT:
+#   Default:  5744  / 0.05 = ~115 KB/s theoretical (actual ~28-34 KB/s)
+#   Tuned:   65535 / 0.05 = ~1.3 MB/s theoretical (actual ~300-600 KB/s)
+# Requires a clean PlatformIO build after adding this file (pio run --target clean).
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64

@@ -232,6 +232,11 @@ void downloader_run() {
     }
 
     int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+        // Disable Nagle's algorithm — eliminates last-packet lag on HTTP connections.
+        WiFiClient* rawClient = http.getStreamPtr();
+        if (rawClient) rawClient->setNoDelay(true);
+    }
     if (code != HTTP_CODE_OK) {
         snprintf(s_dl_status, sizeof(s_dl_status), "error: HTTP %d", code);
         http.end();
