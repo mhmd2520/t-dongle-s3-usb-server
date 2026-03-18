@@ -337,7 +337,7 @@ async function dlPoll(){
       var sz=d.content_len>0?fs(d.bytes_recv)+' / '+fs(d.content_len):(d.bytes_recv>0?fs(d.bytes_recv):'');
       var spd=fspd(d.speed_kbps);
       var eta='';if(d.speed_kbps>0&&d.content_len>0&&d.bytes_recv<d.content_len){var rem=Math.round((d.content_len-d.bytes_recv)/(d.speed_kbps*1024));eta=ft(rem);}
-      var parts=['\u2b07 '+(d.filename||'file')];if(sz)parts.push(sz);if(spd)parts.push(spd);if(eta)parts.push('ETA: '+eta);
+      var parts=['\u2b07 '+(d.filename||'file')];if(sz)parts.push('Size: '+sz);if(spd)parts.push('Speed: '+spd);if(eta)parts.push('ETA: '+eta);
       showToast(parts.join(' \u2014 '),true);
     }else{
       clearInterval(g_dlPoll);g_dlPoll=null;dlCancelBtn(false);setBusy(false);navLock(false);
