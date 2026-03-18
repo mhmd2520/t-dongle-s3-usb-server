@@ -201,6 +201,7 @@ function navLock(on){document.getElementById('bk').disabled=on||(hIdx===0);docum
 var SORTS=['&#8645; Name','&#8645; Name&#8595;','&#8645; Size&#8595;'];
 function fs(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';}
 function ft(s){if(s<1)return '<1s';return s<60?Math.ceil(s)+'s':Math.floor(s/60)+'m '+Math.ceil(s%60)+'s';}
+function fspd(k){return k<=0?'':k>=1024?(k/1024).toFixed(1)+' MB/s':k+' KB/s';}
 function isImg(n){return /\.(jpe?g|png|gif|webp|bmp|svg)$/i.test(n);}
 function updNav(){if(g_busy>0)return;document.getElementById('bk').disabled=hIdx===0;document.getElementById('fw').disabled=hIdx>=hist.length-1;}
 function setBread(p){var b='<a href="#" onclick="goTo(\'/\')">root</a>';var pts=p.split('/').filter(Boolean),a='';pts.forEach(function(x){a+='/'+x;var pa=a;b+=' / <a href="#" onclick="goTo(\''+je(pa)+'\')">'+x+'</a>';});document.getElementById('bread').innerHTML=b;}
@@ -333,7 +334,11 @@ async function dlPoll(){
       clearInterval(g_dlPoll);g_dlPoll=null;
       showCfModal(d.conflict);
     }else if(d.active){
-      showToast('\u2b07 '+(d.filename||'file')+' \u2014 '+d.status,true);
+      var sz=d.content_len>0?fs(d.bytes_recv)+' / '+fs(d.content_len):(d.bytes_recv>0?fs(d.bytes_recv):'');
+      var spd=fspd(d.speed_kbps);
+      var eta='';if(d.speed_kbps>0&&d.content_len>0&&d.bytes_recv<d.content_len){var rem=Math.round((d.content_len-d.bytes_recv)/(d.speed_kbps*1024));eta=ft(rem);}
+      var parts=['\u2b07 '+(d.filename||'file')];if(sz)parts.push(sz);if(spd)parts.push(spd);if(eta)parts.push('ETA: '+eta);
+      showToast(parts.join(' \u2014 '),true);
     }else{
       clearInterval(g_dlPoll);g_dlPoll=null;dlCancelBtn(false);setBusy(false);navLock(false);
       if(d.status&&d.status!=='idle'){
@@ -1146,11 +1151,14 @@ static void handle_api_download(AsyncWebServerRequest* req) {
 
 static void handle_dl_status(AsyncWebServerRequest* req) {
     JsonDocument doc;
-    doc["active"]   = downloader_is_busy();
-    doc["progress"] = downloader_progress();
-    doc["filename"] = downloader_filename();
-    doc["status"]   = downloader_status();
-    doc["conflict"] = downloader_conflict_pending() ? downloader_conflict_name() : "";
+    doc["active"]      = downloader_is_busy();
+    doc["progress"]    = downloader_progress();
+    doc["filename"]    = downloader_filename();
+    doc["status"]      = downloader_status();
+    doc["conflict"]    = downloader_conflict_pending() ? downloader_conflict_name() : "";
+    doc["speed_kbps"]  = downloader_speed();
+    doc["bytes_recv"]  = downloader_bytes_recv();
+    doc["content_len"] = downloader_content_len();
     String json;
     serializeJson(doc, json);
     send_json(req, 200, json);

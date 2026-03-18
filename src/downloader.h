@@ -11,6 +11,15 @@ bool        downloader_is_busy();
 // 0-100 if Content-Length known; -1 if chunked/unknown size.
 int         downloader_progress();
 
+// Current download speed in KB/s.  0 before first sample.
+int         downloader_speed();
+
+// Bytes received so far in the active (or last) download.
+int32_t     downloader_bytes_recv();
+
+// Total content length in bytes as reported by the server; -1 if unknown.
+int         downloader_content_len();
+
 // Filename being (or last) downloaded, e.g. "file.zip".
 const char* downloader_filename();
 

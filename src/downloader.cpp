@@ -24,6 +24,9 @@ static volatile int     s_dl_progress      = 0;       // 0-100 or -1
 static char             s_dl_filename[DL_FNAME_MAX + 1];
 static char             s_dl_status[80];
 static uint8_t          s_buf[DL_BUF_SIZE];
+static volatile int     s_dl_speed_kbps    = 0;       // KB/s, updated every ~1 s
+static volatile int32_t s_dl_bytes_recv    = 0;       // bytes received so far
+static volatile int     s_dl_content_len   = -1;      // server Content-Length (-1 if unknown)
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -137,6 +140,18 @@ int downloader_progress() {
     return (int)s_dl_progress;
 }
 
+int downloader_speed() {
+    return (int)s_dl_speed_kbps;
+}
+
+int32_t downloader_bytes_recv() {
+    return s_dl_bytes_recv;
+}
+
+int downloader_content_len() {
+    return (int)s_dl_content_len;
+}
+
 const char* downloader_filename() {
     return s_dl_filename;
 }
@@ -151,10 +166,13 @@ void downloader_run() {
     if (!s_dl_pending) return;
 
     // Claim the work
-    s_dl_pending = false;
+    s_dl_pending       = false;
     if (s_dl_active) return;   // safety guard
-    s_dl_active   = true;
-    s_dl_progress = 0;
+    s_dl_active        = true;
+    s_dl_progress      = 0;
+    s_dl_speed_kbps    = 0;
+    s_dl_bytes_recv    = 0;
+    s_dl_content_len   = -1;
     snprintf(s_dl_status, sizeof(s_dl_status), "downloading");
 
     // Pre-flight: SD ready
@@ -264,6 +282,7 @@ void downloader_run() {
 
     int content_len = http.getSize();
     bool known_size = (content_len > 0);
+    s_dl_content_len = content_len;
 
     // ── Open SD file ──────────────────────────────────────────────────────────
     File outf = SD_MMC.open(sdpath.c_str(), FILE_WRITE);
@@ -278,10 +297,12 @@ void downloader_run() {
 
     // ── Stream loop ───────────────────────────────────────────────────────────
     WiFiClient* stream = http.getStreamPtr();
-    int32_t bytes_recv = 0;
-    int32_t last_lcd   = -DL_LCD_EVERY;   // force first update immediately
-    bool write_err  = false;
-    bool cancelled  = false;
+    int32_t bytes_recv  = 0;
+    int32_t last_lcd    = -DL_LCD_EVERY;   // force first update immediately
+    bool    write_err   = false;
+    bool    cancelled   = false;
+    uint32_t speed_t0   = millis();        // for rolling speed window
+    int32_t  speed_byt0 = 0;
 
     while (http.connected() || stream->available()) {
         // Cancel check — set by Core 0 via downloader_cancel()
@@ -295,6 +316,17 @@ void downloader_run() {
                 size_t written = outf.write(s_buf, (size_t)n);
                 if (written != (size_t)n) { write_err = true; break; }
                 bytes_recv += n;
+                s_dl_bytes_recv = bytes_recv;
+
+                // Rolling 1 s speed window
+                uint32_t now = millis();
+                uint32_t dt  = now - speed_t0;
+                if (dt >= 1000) {
+                    int32_t delta = bytes_recv - speed_byt0;
+                    if (dt > 0) s_dl_speed_kbps = (int)((int64_t)delta * 1000 / dt / 1024);
+                    speed_t0   = now;
+                    speed_byt0 = bytes_recv;
+                }
 
                 // Update progress state
                 if (known_size) {
@@ -310,14 +342,9 @@ void downloader_run() {
                 // LCD update every DL_LCD_EVERY bytes
                 if (bytes_recv - last_lcd >= DL_LCD_EVERY) {
                     last_lcd = bytes_recv;
-                    if (known_size) {
-                        lcd_show_progress(s_dl_filename, (uint8_t)s_dl_progress);
-                    } else {
-                        char lbl[80];
-                        snprintf(lbl, sizeof(lbl), "%s\n%d KB",
-                                 s_dl_filename, (int)(bytes_recv / 1024));
-                        lcd_show_progress(lbl, 0);
-                    }
+                    lcd_show_progress(s_dl_filename,
+                                      known_size ? (uint8_t)s_dl_progress : 0,
+                                      (int)s_dl_speed_kbps, bytes_recv, content_len);
                 }
             }
         } else {
