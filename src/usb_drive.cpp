@@ -5,11 +5,7 @@
 #include <SD_MMC.h>
 #include <sdmmc_cmd.h>
 
-// fs::SDMMCFS::_card is protected in Arduino Core 2.x — there is no public card() accessor.
-// Expose it via a derived-class accessor (standard workaround for Core 2.x).
-struct SDMMCCardAccessor : public fs::SDMMCFS {
-    sdmmc_card_t* card() { return _card; }
-};
+// SD_MMC.card() is public in Arduino Core 3.x — no workaround needed.
 
 static USBMSC             s_msc;
 static bool               s_active  = false;
@@ -49,7 +45,7 @@ static int32_t on_write(uint32_t lba, uint32_t offset, uint8_t* buf, uint32_t bu
 // ── Public API ────────────────────────────────────────────────────────────────
 
 bool usb_drive_begin() {
-    s_card = reinterpret_cast<SDMMCCardAccessor*>(&SD_MMC)->card();
+    s_card = SD_MMC.card();
     if (!s_card) {
         Serial.println("[USB] SD card not initialised — cannot start MSC");
         return false;
