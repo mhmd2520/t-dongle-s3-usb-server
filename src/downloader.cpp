@@ -1,4 +1,5 @@
 #include "downloader.h"
+#include "actlog.h"
 #include "storage.h"
 #include "lcd.h"
 #include <SD_MMC.h>
@@ -12,14 +13,16 @@
 #define DL_LCD_EVERY 32768   // update LCD every 32 KB
 
 // ── State (volatile fields are read by Core 0 via API handlers) ───────────────
-static volatile bool  s_dl_pending  = false;   // Core 0 sets, Core 1 clears
-static char           s_dl_url[DL_URL_MAX + 1];
-static volatile bool  s_dl_active   = false;
-static volatile bool  s_dl_cancel   = false;   // Core 0 sets → Core 1 aborts stream loop
-static volatile int   s_dl_progress = 0;       // 0-100 or -1
-static char           s_dl_filename[DL_FNAME_MAX + 1];
-static char           s_dl_status[80];
-static uint8_t        s_buf[DL_BUF_SIZE];
+static volatile bool    s_dl_pending       = false;   // Core 0 sets, Core 1 clears
+static char             s_dl_url[DL_URL_MAX + 1];
+static volatile bool    s_dl_active        = false;
+static volatile bool    s_dl_cancel        = false;   // Core 0 sets → Core 1 aborts
+static volatile uint8_t s_dl_conflict      = 0;       // 0=none,1=waiting,2=replace,3=skip,4=cancel
+static char             s_dl_conflict_name[DL_FNAME_MAX + 1];
+static volatile int     s_dl_progress      = 0;       // 0-100 or -1
+static char             s_dl_filename[DL_FNAME_MAX + 1];
+static char             s_dl_status[80];
+static uint8_t          s_buf[DL_BUF_SIZE];
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -77,27 +80,7 @@ static void parse_filename(const char* url, char* out) {
 
     if (ti == 0) strncpy(tmp, "download", DL_FNAME_MAX);
 
-    // Collision avoidance on SD
-    String base = "/" + String(tmp);
-    if (!SD_MMC.exists(base.c_str())) {
-        strncpy(out, tmp, DL_FNAME_MAX); out[DL_FNAME_MAX] = '\0';
-        return;
-    }
-    // Split into stem + ext
-    String stem = tmp, ext = "";
-    int dot = String(tmp).lastIndexOf('.');
-    if (dot > 0) { stem = String(tmp).substring(0, dot); ext = String(tmp).substring(dot); }
-    for (int i = 2; i <= 99; i++) {
-        String candidate = "/" + stem + "_" + i + ext;
-        if (!SD_MMC.exists(candidate.c_str())) {
-            String fn = stem + "_" + i + ext;
-            strncpy(out, fn.c_str(), DL_FNAME_MAX); out[DL_FNAME_MAX] = '\0';
-            return;
-        }
-    }
-    // All taken — overwrite _99
-    String fn = stem + "_99" + ext;
-    strncpy(out, fn.c_str(), DL_FNAME_MAX); out[DL_FNAME_MAX] = '\0';
+    strncpy(out, tmp, DL_FNAME_MAX); out[DL_FNAME_MAX] = '\0';
 }
 
 // Rough filename from URL for immediate API response (no SD check needed).
@@ -128,9 +111,25 @@ bool downloader_is_busy() {
 
 void downloader_cancel() {
     if (s_dl_active || s_dl_pending) {
-        s_dl_pending = false;   // drop queued-but-not-started download too
+        s_dl_pending = false;
         s_dl_cancel  = true;
+        if (s_dl_conflict == 1) s_dl_conflict = 4;  // unblock conflict wait
     }
+}
+
+bool downloader_conflict_pending() {
+    return s_dl_conflict == 1;
+}
+
+const char* downloader_conflict_name() {
+    return s_dl_conflict_name;
+}
+
+void downloader_resolve(const char* action) {
+    if (s_dl_conflict != 1) return;
+    if      (strcmp(action, "replace") == 0) s_dl_conflict = 2;
+    else if (strcmp(action, "skip")    == 0) s_dl_conflict = 3;
+    else                                     s_dl_conflict = 4;  // cancel
 }
 
 int downloader_progress() {
@@ -171,8 +170,46 @@ void downloader_run() {
         return;
     }
 
-    // Parse filename (with collision avoidance)
+    // Parse filename from URL
     parse_filename(s_dl_url, s_dl_filename);
+
+    // Conflict check — if file exists, pause and ask user (Replace / Skip / Cancel)
+    {
+        String sdpath_chk = "/" + String(s_dl_filename);
+        if (SD_MMC.exists(sdpath_chk.c_str())) {
+            strncpy(s_dl_conflict_name, s_dl_filename, sizeof(s_dl_conflict_name) - 1);
+            s_dl_conflict_name[sizeof(s_dl_conflict_name) - 1] = '\0';
+            snprintf(s_dl_status, sizeof(s_dl_status), "conflict");
+            s_dl_conflict = 1;  // WAITING
+
+            uint32_t deadline = millis() + 60000UL;   // 60 s timeout → auto-cancel
+            while (s_dl_conflict == 1 && millis() < deadline) {
+                delay(100);
+                yield();
+            }
+
+            uint8_t res = s_dl_conflict;
+            s_dl_conflict = 0;
+
+            if (res == 3) {  // Skip
+                snprintf(s_dl_status, sizeof(s_dl_status), "skipped");
+                s_dl_active = false;
+                lcd_invalidate_layout();
+                actlog_add(ACT_SKIP, s_dl_filename, "Skipped (file exists)");
+                return;
+            }
+            if (res != 2) {  // Cancel or timeout
+                s_dl_cancel = false;
+                snprintf(s_dl_status, sizeof(s_dl_status), "cancelled");
+                s_dl_active = false;
+                lcd_invalidate_layout();
+                actlog_add(ACT_CANCEL, s_dl_filename, "Cancelled");
+                return;
+            }
+            // res == 2: Replace — delete existing file before writing
+            SD_MMC.remove(sdpath_chk.c_str());
+        }
+    }
 
     // First LCD paint
     lcd_show_progress(s_dl_filename, 0);
@@ -284,6 +321,7 @@ void downloader_run() {
         snprintf(s_dl_status, sizeof(s_dl_status), "cancelled");
         s_dl_active = false;
         lcd_invalidate_layout();
+        actlog_add(ACT_CANCEL, s_dl_filename, "Cancelled");
         Serial.printf("[DL] Cancelled: /%s\n", s_dl_filename);
         return;
     }
@@ -294,6 +332,7 @@ void downloader_run() {
         snprintf(s_dl_status, sizeof(s_dl_status), "error: write failed");
         s_dl_active = false;
         lcd_invalidate_layout();
+        actlog_add(ACT_WARN, s_dl_filename, "Write error");
         return;
     }
 
@@ -304,6 +343,7 @@ void downloader_run() {
                  "error: incomplete (%d/%d B)", (int)bytes_recv, content_len);
         s_dl_active = false;
         lcd_invalidate_layout();
+        actlog_add(ACT_WARN, s_dl_filename, "Incomplete download");
         return;
     }
 
@@ -315,6 +355,12 @@ void downloader_run() {
     lcd_invalidate_layout();
     s_dl_active = false;
 
+    {
+        char dl_detail[32];
+        if (bytes_recv >= 1048576) snprintf(dl_detail, sizeof(dl_detail), "%.1f MB", bytes_recv / 1048576.0f);
+        else                       snprintf(dl_detail, sizeof(dl_detail), "%d KB",   (int)(bytes_recv / 1024));
+        actlog_add(ACT_DL, s_dl_filename, dl_detail);
+    }
     Serial.printf("[DL] Done: /%s (%d bytes)\n", s_dl_filename, (int)bytes_recv);
 }
 

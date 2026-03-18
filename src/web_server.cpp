@@ -5,6 +5,7 @@
 #include "themes.h"
 #include "lcd.h"
 #include "downloader.h"
+#include "actlog.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -144,8 +145,10 @@ progress{width:100%;height:6px;margin-top:5px;display:none}.spd{font-size:.75em;
 .dlbar{display:flex;gap:5px;margin-bottom:8px;align-items:center}
 .dlin{flex:1;min-width:0;padding:5px 8px;background:#1c1c1c;border:1px solid #2a2a2a;border-radius:5px;color:#eee;font-size:.78em}
 .dlin::placeholder{color:#444}
+.lgsec{margin-top:12px;border:1px solid #222;border-radius:6px;overflow:hidden}.lghdr{background:#111;padding:7px 10px;cursor:pointer;display:flex;justify-content:space-between;font-size:.8em;color:#777;user-select:none}.lge{display:flex;gap:8px;padding:3px 0;border-bottom:1px solid #0a0a0a;font-size:.74em;align-items:baseline}.lgts{color:#555;min-width:58px;flex-shrink:0}.lgop{min-width:18px;text-align:center;flex-shrink:0}.lgfn{color:#bbb;flex:1;word-break:break-all}.lgdt{color:#666;flex-shrink:0}
 </style></head><body>
 <div class="toast" id="toast"></div>
+<div id="cfModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:1000;justify-content:center;align-items:center"><div style="background:#1a1a1a;border:1px solid #fa0;border-radius:8px;padding:20px;max-width:300px;width:90%;text-align:center"><div style="color:#fa0;margin-bottom:8px;font-size:.85em">&#9888; File already exists</div><div id="cfName" style="color:#ccc;font-size:.8em;word-break:break-all;margin-bottom:14px"></div><div style="display:flex;gap:8px;justify-content:center"><button class="btn" style="background:#060" onclick="dlResolve('replace')">Replace</button><button class="btn" style="background:#440" onclick="dlResolve('skip')">Skip</button><button class="btn" style="background:#400" onclick="dlResolve('cancel')">Cancel</button></div></div></div>
 <h1>&#128190; File Manager <a href="/">&#8592; Config</a></h1>
 <div class="bc" id="bread"></div>
 <div class="card">
@@ -166,7 +169,7 @@ progress{width:100%;height:6px;margin-top:5px;display:none}.spd{font-size:.75em;
 <div class="dlbar">
   <input class="dlin" type="url" id="dlurl" placeholder="Paste URL to download to SD&#8230;" autocomplete="off">
   <button class="btn c" onclick="dlUrl()">&#8659; URL</button>
-  <button class="btn" id="dlcancel" style="display:none;background:#400;color:#f88" onclick="dlCancel()">&#10005;</button>
+  <button class="btn" id="dlcancel" style="display:none;background:#400;color:#f88" onclick="dlCancel()">Cancel</button>
 </div>
 <div class="selbar" id="selbar">
   <input type="checkbox" class="chk" id="chkAll" onchange="selAll(this.checked)">
@@ -188,10 +191,12 @@ progress{width:100%;height:6px;margin-top:5px;display:none}.spd{font-size:.75em;
 </div>
 <div id="ls"></div>
 </div>
+<div class="lgsec"><div class="lghdr" onclick="toggleLog()">&#128221; Activity Log <span id="lgtog">&#9660;</span></div><div id="lgbody" style="display:none;padding:6px 4px;max-height:180px;overflow-y:auto"></div></div>
 <script>
 var cp='/',hist=['/'],hIdx=0,g_ent=[],g_sort=0,g_sm=false,g_ent_bk=[],g_st=null,g_busy=0;
-function showToast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display=msg?'block':'none';}
-function setBusy(on,msg){g_busy=Math.max(0,g_busy+(on?1:-1));if(g_busy>0){showToast(msg||'\u23f3 Working\u2026');}else{showToast('');}}
+var g_toastTimer=null;
+function showToast(msg,persist){var t=document.getElementById('toast');t.textContent=msg;t.style.display=msg?'block':'none';if(g_toastTimer){clearTimeout(g_toastTimer);g_toastTimer=null;}if(msg&&!persist&&!g_dlPoll){g_toastTimer=setTimeout(function(){showToast('');},3000);}}
+function setBusy(on,msg){g_busy=Math.max(0,g_busy+(on?1:-1));if(g_busy>0){showToast(msg||'\u23f3 Working\u2026',true);}else{showToast('');}}
 function navLock(on){document.getElementById('bk').disabled=on||(hIdx===0);document.getElementById('fw').disabled=on||(hIdx>=hist.length-1);}
 var SORTS=['&#8645; Name','&#8645; Name&#8595;','&#8645; Size&#8595;'];
 function fs(n){return n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':n<1073741824?(n/1048576).toFixed(1)+' MB':(n/1073741824).toFixed(2)+' GB';}
@@ -266,16 +271,16 @@ async function dlBlob(url,name){
 }
 async function rm(p){if(!confirm('Delete "'+p.split('/').pop()+'"?'))return;
 var r=await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+encodeURIComponent(p)});
-var d=await r.json();if(d.ok){if(g_sm)searchAll();else loadDir(cp);}else alert('Delete failed');}
+var d=await r.json();if(d.ok){if(g_sm)searchAll();else loadDir(cp);loadLog();}else alert('Delete failed');}
 async function rnm(fp,name){var nn=prompt('Rename to:',name);if(!nn||nn===name)return;
 var dir=fp.substring(0,fp.lastIndexOf('/'));var to=(dir===''?'':dir)+'/'+nn;
 var r=await fetch('/api/rename',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'from='+encodeURIComponent(fp)+'&to='+encodeURIComponent(to)});
-var d=await r.json();if(d.ok){if(g_sm)searchAll();else loadDir(cp);}else alert('Rename failed');}
+var d=await r.json();if(d.ok){if(g_sm)searchAll();else loadDir(cp);loadLog();}else alert('Rename failed');}
 async function mkD(){var n=prompt('Folder name:');if(!n)return;
 var fp=(cp==='/'?'':cp)+'/'+n;
 setBusy(true,'\uD83D\uDCC1 Creating \u201C'+n+'\u201D\u2026');
 var r=await fetch('/api/mkdir',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'path='+encodeURIComponent(fp)});
-var d=await r.json();setBusy(false);if(d.ok){showToast('\u2713 Folder created');loadDir(cp);}else alert('mkdir failed');}
+var d=await r.json();setBusy(false);if(d.ok){showToast('\u2713 Folder created');loadDir(cp);loadLog();}else alert('mkdir failed');}
 function updSel(){var all=document.querySelectorAll('.item-chk');var chk=document.querySelectorAll('.item-chk:checked');
 document.getElementById('chkAll').checked=all.length>0&&chk.length===all.length;
 document.getElementById('chkAll').indeterminate=chk.length>0&&chk.length<all.length;
@@ -303,7 +308,7 @@ else{destPath=cp==='/'?'':cp;}var ok=await upXHR(file,destPath,i,files.length,pg
 pgEl.style.display='none';spdEl.textContent='';setBusy(false);navLock(false);
 if(failed){umEl.textContent=failed+' file(s) failed';umEl.className='msg ng';}
 else{umEl.textContent='Done! '+files.length+' file'+(files.length>1?'s':'')+' uploaded';umEl.className='msg ok';}
-setTimeout(function(){umEl.className='msg';},4000);loadDir(cp);}
+setTimeout(function(){umEl.className='msg';},4000);loadDir(cp);loadLog();}
 var g_dlPoll=null;
 function dlCancelBtn(show){document.getElementById('dlcancel').style.display=show?'':'none';}
 function startDlPoll(){clearInterval(g_dlPoll);g_dlPoll=setInterval(dlPoll,2000);}
@@ -324,24 +329,37 @@ async function dlUrl(){
 async function dlPoll(){
   try{
     var r=await fetch('/api/dl-status');var d=await r.json();
-    if(d.active){
-      showToast('\u2b07 '+(d.filename||'file')+' \u2014 '+d.status);
+    if(d.conflict){
+      clearInterval(g_dlPoll);g_dlPoll=null;
+      showCfModal(d.conflict);
+    }else if(d.active){
+      showToast('\u2b07 '+(d.filename||'file')+' \u2014 '+d.status,true);
     }else{
       clearInterval(g_dlPoll);g_dlPoll=null;dlCancelBtn(false);setBusy(false);navLock(false);
       if(d.status&&d.status!=='idle'){
         var ok=d.status==='done';
         var cancelled=d.status==='cancelled';
         showToast(ok?'\u2713 Done: '+(d.filename||''):cancelled?'\u23f9 Cancelled':(d.filename||'')+' \u2014 '+d.status);
-        if(ok)setTimeout(function(){loadDir(cp);},1200);
+        if(ok)setTimeout(function(){loadDir(cp);loadLog();},1200);else loadLog();
       }
     }
   }catch(e){clearInterval(g_dlPoll);g_dlPoll=null;dlCancelBtn(false);setBusy(false);navLock(false);}
 }
 async function dlCancel(){
-  try{await fetch('/api/dl-cancel',{method:'POST'});showToast('\u23f9 Cancelling\u2026');}catch(e){}
+  try{await fetch('/api/dl-cancel',{method:'POST'});showToast('\u23f9 Cancelling\u2026',true);}catch(e){}
 }
+function showCfModal(name){document.getElementById('cfName').textContent=name;var m=document.getElementById('cfModal');m.style.display='flex';}
+function hideCfModal(){document.getElementById('cfModal').style.display='none';}
+async function dlResolve(action){
+  hideCfModal();
+  try{await fetch('/api/dl-resolve',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action='+action});}catch(e){}
+  startDlPoll();
+}
+var g_logOpen=false;
+function toggleLog(){g_logOpen=!g_logOpen;document.getElementById('lgbody').style.display=g_logOpen?'block':'none';document.getElementById('lgtog').textContent=g_logOpen?'\u25b2':'\u25bc';if(g_logOpen)loadLog();}
+async function loadLog(){if(!g_logOpen)return;try{var r=await fetch('/api/log');var d=await r.json();var html=d.length?d.map(function(e){return '<div class="lge"><span class="lgts">'+e.ts+'</span><span class="lgop">'+e.icon+'</span><span class="lgfn">'+e.name+'</span><span class="lgdt">'+e.detail+'</span></div>';}).join(''):'<div style="color:#555;font-size:.75em;padding:4px">No activity yet</div>';document.getElementById('lgbody').innerHTML=html;}catch(e){}}
 goTo('/');
-(async function(){try{var r=await fetch('/api/dl-status');var d=await r.json();if(d.active){navLock(true);setBusy(true,'\u2b07 '+(d.filename||'download')+' in progress');dlCancelBtn(true);startDlPoll();}}catch(e){}})();
+(async function(){try{var r=await fetch('/api/dl-status');var d=await r.json();if(d.active){navLock(true);setBusy(true,'\u2b07 '+(d.filename||'download')+' in progress',true);dlCancelBtn(true);startDlPoll();}else if(d.conflict){showCfModal(d.conflict);}}catch(e){}})();
 </script></body></html>
 )html";
 
@@ -971,12 +989,14 @@ static void handle_upload(AsyncWebServerRequest* req) {
     // Called after all body chunks are received.
     UploadCtx* ctx = req->_tempObject ? (UploadCtx*)req->_tempObject : nullptr;
     bool ok = ctx && ctx->ok;
+    String fname;
     if (ctx) {
-        if (ctx->file) ctx->file.close();
+        if (ctx->file) { fname = ctx->file.name(); ctx->file.close(); }
         if (ctx->busy_held) busy_clear();
         delete ctx;
         req->_tempObject = nullptr;
     }
+    if (ok && fname.length()) actlog_add(ACT_UPLOAD, fname.c_str());
     send_json(req, ok ? 200 : 500,
               ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"upload failed\"}");
 }
@@ -1024,13 +1044,16 @@ static void handle_delete(AsyncWebServerRequest* req) {
     String path = qparam(req, "path");
     if (path.isEmpty()) { send_json(req, 400, "{\"ok\":false}"); return; }
     bool ok = SD_MMC.remove(path) || SD_MMC.rmdir(path);
+    if (ok) actlog_add(ACT_DEL, path.c_str());
     send_json(req, 200, ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
 static void handle_mkdir(AsyncWebServerRequest* req) {
     String path = qparam(req, "path");
     if (path.isEmpty()) { send_json(req, 400, "{\"ok\":false}"); return; }
-    send_json(req, 200, SD_MMC.mkdir(path) ? "{\"ok\":true}" : "{\"ok\":false}");
+    bool ok = SD_MMC.mkdir(path);
+    if (ok) actlog_add(ACT_MKDIR, path.c_str());
+    send_json(req, 200, ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
 static void handle_rename(AsyncWebServerRequest* req) {
@@ -1040,6 +1063,10 @@ static void handle_rename(AsyncWebServerRequest* req) {
         send_json(req, 400, "{\"ok\":false,\"error\":\"params required\"}"); return;
     }
     bool ok = SD_MMC.rename(from, to);
+    if (ok) {
+        String detail = "\u2192 " + to.substring(to.lastIndexOf('/') + 1);
+        actlog_add(ACT_RENAME, from.substring(from.lastIndexOf('/') + 1).c_str(), detail.c_str());
+    }
     send_json(req, 200, ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"rename failed\"}");
 }
 
@@ -1123,6 +1150,7 @@ static void handle_dl_status(AsyncWebServerRequest* req) {
     doc["progress"] = downloader_progress();
     doc["filename"] = downloader_filename();
     doc["status"]   = downloader_status();
+    doc["conflict"] = downloader_conflict_pending() ? downloader_conflict_name() : "";
     String json;
     serializeJson(doc, json);
     send_json(req, 200, json);
@@ -1131,6 +1159,17 @@ static void handle_dl_status(AsyncWebServerRequest* req) {
 static void handle_dl_cancel(AsyncWebServerRequest* req) {
     downloader_cancel();
     send_json(req, 200, "{\"ok\":true}");
+}
+
+static void handle_dl_resolve(AsyncWebServerRequest* req) {
+    String action = qparam(req, "action");
+    downloader_resolve(action.c_str());
+    send_json(req, 200, "{\"ok\":true}");
+}
+
+static void handle_log(AsyncWebServerRequest* req) {
+    String json = actlog_get_json();
+    send_json(req, 200, json);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
@@ -1156,6 +1195,8 @@ void web_server_begin() {
     server.on("/api/download",   HTTP_POST, handle_api_download);
     server.on("/api/dl-status",  HTTP_GET,  handle_dl_status);
     server.on("/api/dl-cancel",  HTTP_POST, handle_dl_cancel);
+    server.on("/api/dl-resolve", HTTP_POST, handle_dl_resolve);
+    server.on("/api/log",        HTTP_GET,  handle_log);
     // Upload: completion handler + body handler (raw binary, no multipart)
     server.on("/upload", HTTP_POST, handle_upload, nullptr, handle_upload_body);
     server.onNotFound(handle_not_found);

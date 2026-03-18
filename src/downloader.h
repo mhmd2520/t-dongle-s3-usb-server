@@ -21,6 +21,15 @@ const char* downloader_status();
 // The stream loop will stop, delete the partial file, and set status "cancelled".
 void        downloader_cancel();
 
+// True when a filename conflict is waiting for user resolution.
+bool        downloader_conflict_pending();
+
+// Name of the conflicting file (valid only when downloader_conflict_pending()).
+const char* downloader_conflict_name();
+
+// Resolve a pending conflict.  action = "replace" | "skip" | "cancel"
+void        downloader_resolve(const char* action);
+
 // Execute pending download. Must be called from main loop (Core 1) only.
 void        downloader_run();
 
