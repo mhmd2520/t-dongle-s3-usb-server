@@ -345,7 +345,7 @@ async function dlPoll(){
         var ok=d.status==='done';
         var cancelled=d.status==='cancelled';
         showToast(ok?'\u2713 Done: '+(d.filename||''):cancelled?'\u23f9 Cancelled':(d.filename||'')+' \u2014 '+d.status);
-        if(ok)setTimeout(function(){loadDir(cp);loadLog();},1200);else loadLog();
+        if(ok||cancelled||d.status==='skipped')setTimeout(function(){loadDir(cp);loadLog();},1200);else loadLog();
       }
     }
   }catch(e){clearInterval(g_dlPoll);g_dlPoll=null;dlCancelBtn(false);setBusy(false);navLock(false);}
