@@ -377,7 +377,7 @@ void lcd_show_progress(const String& label, uint8_t percent,
         // Row 3 (y=126..138): remaining time (only when size is known)
         fmt_eta(sbuf, sizeof(sbuf), speed_kbps, bytes_recv, content_len);
         tft.fillRect(0, 126, LCD_W, 13, C_BG);
-        tft.setTextColor(C_DIM, C_BG);
+        tft.setTextColor(C_WARN, C_BG);
         tft.drawString(sbuf, LCD_W / 2, 133);
 
         s_prog_last_spd = speed_kbps;

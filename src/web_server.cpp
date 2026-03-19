@@ -117,7 +117,7 @@ static void send_busy(AsyncWebServerRequest* req) {
 
 static const char FILEMAN_HTML[] =
 R"html(
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Files</title><style>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upload</title><style>
 *{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0d0d0d;color:#eee;max-width:600px;margin:0 auto;padding:12px}
 h1{color:#0cf;font-size:1.1em;padding:8px 0 4px;display:flex;justify-content:space-between;align-items:center}h1 a{color:#0cf;font-size:.8em;font-weight:400;text-decoration:none}
 .bc{font-size:.76em;color:#555;margin-bottom:8px;word-break:break-all}.bc a{color:#0cf;text-decoration:none}
@@ -154,7 +154,7 @@ progress{width:100%;height:6px;margin-top:5px;display:none}.spd{font-size:.75em;
 <div class="bar">
   <button class="btn c" id="bk" onclick="goBack()" disabled>&#8592;</button>
   <button class="btn c" id="fw" onclick="goFwd()" disabled>&#8594;</button>
-  <button class="btn c" onclick="tup(0)">&#8679; Files</button>
+  <button class="btn c" onclick="tup(0)">&#8679; Upload</button>
   <button class="btn c" onclick="tup(1)">&#128193; Folder</button>
   <button class="btn c" onclick="mkD()">&#10133; New Folder</button>
   <button class="btn g" id="sortBtn" onclick="togSort()">&#8645; Name</button>

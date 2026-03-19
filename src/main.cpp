@@ -120,9 +120,9 @@ void setup() {
             if (bf) {
                 bf.print("@echo off\r\n");
                 bf.print("echo Switching USB Smart Drive to Network Mode...\r\n");
-                bf.print("echo Device will restart in Network Mode in ~20 seconds.\r\n");
+                bf.print("echo Device will restart in Network Mode now.\r\n");
                 bf.print("echo SWITCH_TO_NETWORK > \"%~d0\\_switch_network.txt\"\r\n");
-                bf.print("pause\r\n");
+                bf.print("timeout /t 3 /nobreak >nul\r\n");
                 bf.close();
             }
         }
