@@ -5,13 +5,37 @@
 #include <SD_MMC.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <NetworkClient.h>     // Core 3.x: getStreamPtr() returns NetworkClient*
 #include <lwip/sockets.h>    // SO_RCVBUF — increases advertised TCP receive window at runtime
+#include <freertos/semphr.h>
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-#define DL_URL_MAX   512
-#define DL_FNAME_MAX  63
-#define DL_BUF_SIZE 32768    // 32 KB transfer buffer — reduces SD write calls and loop overhead
-#define DL_LCD_EVERY 32768   // update LCD every 32 KB
+#define DL_URL_MAX    512
+#define DL_FNAME_MAX   63
+#define DL_HALF_SIZE  32768  // each ping-pong buffer half (32 KB)
+#define DL_BUF_SIZE   65536  // total buffer: two DL_HALF_SIZE halves for double-buffering
+#define DL_LCD_EVERY  65536  // update LCD every 64 KB received
+
+// ── SD write task — runs on Core 1 alongside Arduino loop ─────────────────────
+// During SDMMC DMA, the task blocks on a FreeRTOS semaphore (CPU released),
+// allowing the Arduino loop to keep draining the TCP socket concurrently.
+static SemaphoreHandle_t s_wr_start = nullptr;  // main → task: data ready to write
+static SemaphoreHandle_t s_wr_done  = nullptr;  // task → main: write complete
+static File*             s_wr_file  = nullptr;
+static uint8_t*          s_wr_ptr   = nullptr;  // nullptr = terminate
+static size_t            s_wr_len   = 0;
+static bool              s_wr_err   = false;
+
+static void sd_writer_task(void*) {
+    while (true) {
+        xSemaphoreTake(s_wr_start, portMAX_DELAY);
+        if (!s_wr_ptr) break;                    // nullptr = graceful exit
+        size_t w = s_wr_file->write(s_wr_ptr, s_wr_len);
+        s_wr_err = (w != s_wr_len);
+        xSemaphoreGive(s_wr_done);
+    }
+    vTaskDelete(nullptr);
+}
 
 // ── State (volatile fields are read by Core 0 via API handlers) ───────────────
 static volatile bool    s_dl_pending       = false;   // Core 0 sets, Core 1 clears
@@ -23,7 +47,7 @@ static char             s_dl_conflict_name[DL_FNAME_MAX + 1];
 static volatile int     s_dl_progress      = 0;       // 0-100 or -1
 static char             s_dl_filename[DL_FNAME_MAX + 1];
 static char             s_dl_status[80];
-static uint8_t          s_buf[DL_BUF_SIZE];
+static uint8_t          s_buf[DL_BUF_SIZE];           // ping-pong: [0..32767] and [32768..65535]
 static volatile int     s_dl_speed_kbps    = 0;       // KB/s, updated every ~1 s
 static volatile int32_t s_dl_bytes_recv    = 0;       // bytes received so far
 static volatile int     s_dl_content_len   = -1;      // server Content-Length (-1 if unknown)
@@ -266,9 +290,13 @@ void downloader_run() {
         // Disable Nagle's algorithm — eliminates last-packet lag on HTTP connections.
         // SO_RCVBUF at runtime expands pcb->rcv_wnd from 5760 → 65535 bytes,
         // lifting throughput from ~30 KB/s to ~300–600 KB/s on internet links.
-        WiFiClient* rawClient = http.getStreamPtr();
+        NetworkClient* rawClient = http.getStreamPtr();
         if (rawClient) {
             rawClient->setNoDelay(true);
+            // With CONFIG_LWIP_WND_SCALE=y + CONFIG_LWIP_TCP_RCV_SCALE=3,
+            // the effective TCP window = SO_RCVBUF << 3.  Set SO_RCVBUF to
+            // 65535 so the scaled window reaches 65535*8 = 524 KB, giving the
+            // server up to ~1.3 s of in-flight data at 400 KB/s before stalling.
             int recv_size = 65535;
             rawClient->setSocketOption(SO_RCVBUF, (char*)&recv_size, sizeof(recv_size));
         }
@@ -297,65 +325,162 @@ void downloader_run() {
         return;
     }
 
-    // ── Stream loop ───────────────────────────────────────────────────────────
-    WiFiClient* stream = http.getStreamPtr();
-    int32_t bytes_recv  = 0;
-    int32_t last_lcd    = -DL_LCD_EVERY;   // force first update immediately
-    bool    write_err   = false;
-    bool    cancelled   = false;
-    uint32_t speed_t0   = millis();        // for rolling speed window
-    int32_t  speed_byt0 = 0;
+    // ── Stream loop (double-buffered) ─────────────────────────────────────────
+    // Two 32 KB ping-pong halves of s_buf[64 KB]:
+    //   rd_buf — being filled from the TCP socket right now
+    //   wr_buf — being written to SD by sd_writer_task (or free)
+    // When rd_buf fills (32 KB), it is swapped into the write task and the
+    // formerly-in-flight wr_buf becomes the new rd_buf.  Because the SDMMC
+    // DMA releases Core 1 while waiting (FreeRTOS semaphore), TCP reads run
+    // concurrently with SD writes — eliminating the burst/pause pattern caused
+    // by the TCP window closing during synchronous SD write stalls.
+    NetworkClient* stream = http.getStreamPtr();
+    if (stream) stream->setTimeout(100);
+    if (!stream) {
+        snprintf(s_dl_status, sizeof(s_dl_status), "error: no stream");
+        outf.close();
+        http.end();
+        if (sc) { delete sc; sc = nullptr; }
+        if (is_replace) SD_MMC.rename(backup_path.c_str(), sdpath.c_str());
+        SD_MMC.remove(sdpath.c_str());
+        s_dl_cancel = false;
+        s_dl_active = false;
+        lcd_invalidate_layout();
+        return;
+    }
 
-    while (http.connected() || stream->available()) {
-        // Cancel check — set by Core 0 via downloader_cancel()
+    // Spin up the SD write task (Core 1, priority 5 > Arduino loop priority 1).
+    s_wr_start = xSemaphoreCreateBinary();
+    s_wr_done  = xSemaphoreCreateBinary();
+    s_wr_file  = &outf;
+    s_wr_err   = false;
+    s_wr_ptr   = nullptr;
+    xTaskCreatePinnedToCore(sd_writer_task, "dl_sd_wr", 4096, nullptr, 5, nullptr, 1);
+
+    uint8_t* rd_buf    = s_buf;               // buffer being filled from TCP
+    uint8_t* wr_buf    = s_buf + DL_HALF_SIZE;// buffer free for next SD write (starts empty)
+    int32_t  rd_fill   = 0;
+    bool     wr_pending = false;
+    int32_t  wr_size    = 0;                  // bytes submitted in current write
+    int32_t  bytes_recv  = 0;
+    int32_t  last_lcd    = -DL_LCD_EVERY;
+    bool     write_err   = false;
+    bool     cancelled   = false;
+    uint32_t speed_t0    = millis();
+    int32_t  speed_byt0  = 0;
+
+    while (true) {
         if (s_dl_cancel) { cancelled = true; break; }
 
-        int avail = stream->available();
-        if (avail > 0) {
-            int chunk = (avail > DL_BUF_SIZE) ? DL_BUF_SIZE : avail;
-            int n = stream->readBytes(s_buf, chunk);
-            if (n > 0) {
-                size_t written = outf.write(s_buf, (size_t)n);
-                if (written != (size_t)n) { write_err = true; break; }
-                bytes_recv += n;
-                s_dl_bytes_recv = bytes_recv;
-
-                // Rolling 1 s speed window
-                uint32_t now = millis();
-                uint32_t dt  = now - speed_t0;
-                if (dt >= 1000) {
-                    int32_t delta = bytes_recv - speed_byt0;
-                    if (dt > 0) s_dl_speed_kbps = (int)((int64_t)delta * 1000 / dt / 1024);
-                    speed_t0   = now;
-                    speed_byt0 = bytes_recv;
-                }
-
-                // Update progress state
-                if (known_size) {
-                    s_dl_progress = (int)((int64_t)bytes_recv * 100 / content_len);
-                    snprintf(s_dl_status, sizeof(s_dl_status),
-                             "downloading (%d%%)", (int)s_dl_progress);
-                } else {
-                    s_dl_progress = -1;
-                    snprintf(s_dl_status, sizeof(s_dl_status),
-                             "downloading (%d KB)", (int)(bytes_recv / 1024));
-                }
-
-                // LCD update every DL_LCD_EVERY bytes
-                if (bytes_recv - last_lcd >= DL_LCD_EVERY) {
-                    last_lcd = bytes_recv;
-                    lcd_show_progress(s_dl_filename,
-                                      known_size ? (uint8_t)s_dl_progress : 0,
-                                      (int)s_dl_speed_kbps, bytes_recv, content_len);
-                }
-            }
-        } else {
-            // No bytes available yet — check if we're done
-            if (known_size && bytes_recv >= (int32_t)content_len) break;
-            // No delay — yield() alone is sufficient to feed the watchdog
+        // Poll: did the pending SD write finish? (non-blocking)
+        if (wr_pending && xSemaphoreTake(s_wr_done, 0) == pdTRUE) {
+            if (s_wr_err) { write_err = true; break; }
+            bytes_recv     += wr_size;
+            s_dl_bytes_recv = bytes_recv;
+            wr_pending = false;
+            // wr_buf is now the just-written buffer — free for next swap
         }
-        yield();   // feed watchdog, let Core 0 handle HTTP requests
+
+        // Drain TCP socket into rd_buf (grab all immediately available bytes)
+        {
+            int space = DL_HALF_SIZE - rd_fill;
+            while (space > 0) {
+                int avail = stream->available();
+                if (avail <= 0) break;
+                int n = stream->readBytes(rd_buf + rd_fill, avail < space ? avail : space);
+                if (n <= 0) break;
+                rd_fill += n;
+                space   -= n;
+            }
+        }
+
+        bool stream_done = !http.connected() && stream->available() == 0;
+        // Count in-flight bytes (submitted but not yet acknowledged) for have_all check
+        int32_t in_flight = wr_pending ? wr_size : 0;
+        bool have_all  = known_size &&
+                         (bytes_recv + in_flight + rd_fill) >= (int32_t)content_len;
+
+        // Submit rd_buf for writing when half-full, stream done, or all bytes in hand.
+        if (rd_fill > 0 && (rd_fill >= DL_HALF_SIZE || stream_done || have_all)) {
+            // Wait (blocking) for any in-flight write to complete first
+            if (wr_pending) {
+                xSemaphoreTake(s_wr_done, portMAX_DELAY);
+                if (s_wr_err) { write_err = true; break; }
+                bytes_recv     += wr_size;
+                s_dl_bytes_recv = bytes_recv;
+                wr_pending = false;
+            }
+
+            // Hand rd_buf to the write task
+            s_wr_ptr  = rd_buf;
+            s_wr_len  = (size_t)rd_fill;
+            wr_size   = rd_fill;
+            xSemaphoreGive(s_wr_start);
+            wr_pending = true;
+
+            // Swap: the just-freed wr_buf becomes the new rd_buf
+            uint8_t* tmp = rd_buf; rd_buf = wr_buf; wr_buf = tmp;
+            rd_fill = 0;
+
+            // Update speed / progress using committed + in-flight bytes
+            int32_t visible = bytes_recv + wr_size;
+            uint32_t now = millis(), dt = now - speed_t0;
+            if (dt >= 1000) {
+                s_dl_speed_kbps = (int)((int64_t)(visible - speed_byt0) * 1000 / dt / 1024);
+                speed_t0   = now;
+                speed_byt0 = visible;
+            }
+            if (known_size) {
+                int pct = (int)((int64_t)visible * 100 / content_len);
+                s_dl_progress = pct;
+                snprintf(s_dl_status, sizeof(s_dl_status), "downloading (%d%%)", pct);
+            } else {
+                s_dl_progress = -1;
+                snprintf(s_dl_status, sizeof(s_dl_status),
+                         "downloading (%d KB)", (int)(visible / 1024));
+            }
+            if (visible - last_lcd >= (int32_t)DL_LCD_EVERY) {
+                last_lcd = visible;
+                lcd_show_progress(s_dl_filename,
+                                  known_size ? (uint8_t)s_dl_progress : 0,
+                                  s_dl_speed_kbps, visible, content_len);
+            }
+        }
+
+        // Exit when stream exhausted and all data committed
+        if (!wr_pending && rd_fill == 0 && (stream_done || have_all)) break;
+
+        if (rd_fill == 0) {
+            vTaskDelay(1);  // nothing to read — yield so lwIP can process ACKs
+        }
+        // (else: data still accumulating — loop immediately)
     }
+
+    // Wait for the final in-flight SD write
+    if (wr_pending) {
+        xSemaphoreTake(s_wr_done, portMAX_DELAY);
+        if (!write_err) {
+            if (s_wr_err) write_err = true;
+            else          bytes_recv += wr_size;
+        }
+        wr_pending = false;
+    }
+    // Write any residual rd_fill that didn't trigger a submit (shouldn't happen
+    // in normal flow, but guard against edge-cases from partial cancelled writes)
+    if (!cancelled && !write_err && rd_fill > 0) {
+        s_wr_ptr = nullptr;  // don't double-use task; write directly
+        size_t w = outf.write(rd_buf, (size_t)rd_fill);
+        if (w != (size_t)rd_fill) write_err = true;
+        else bytes_recv += rd_fill;
+    }
+
+    // Gracefully terminate the SD write task
+    s_wr_ptr = nullptr;
+    xSemaphoreGive(s_wr_start);   // wake task with nullptr → it exits
+    vTaskDelay(20);               // give it time to call vTaskDelete
+    vSemaphoreDelete(s_wr_start); s_wr_start = nullptr;
+    vSemaphoreDelete(s_wr_done);  s_wr_done  = nullptr;
+
     outf.close();
 
     // Limit TLS shutdown wait to 1 s — prevents task watchdog reset on slow servers.
@@ -393,6 +518,7 @@ void downloader_run() {
         if (is_replace) SD_MMC.rename(backup_path.c_str(), sdpath.c_str());  // restore original
         snprintf(s_dl_status, sizeof(s_dl_status),
                  "error: incomplete (%d/%d B)", (int)bytes_recv, content_len);
+        s_dl_cancel = false;   // clear stale cancel flag (mirrors early-exit paths)
         s_dl_active = false;
         lcd_invalidate_layout();
         actlog_add(ACT_WARN, s_dl_filename, "Incomplete download");

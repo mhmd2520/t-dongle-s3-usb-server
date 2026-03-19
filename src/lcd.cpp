@@ -1,8 +1,63 @@
 #include "lcd.h"
 #include "config.h"
 #include "themes.h"
-#include <TFT_eSPI.h>
+#include <LovyanGFX.hpp>
 #include <Preferences.h>
+
+// ── LovyanGFX display config for T-Dongle-S3 (ST7735S 80×160) ────────────────
+class LGFX : public lgfx::LGFX_Device {
+    lgfx::Panel_ST7735S _panel;
+    lgfx::Bus_SPI       _bus;
+    lgfx::Light_PWM     _light;
+public:
+    LGFX() {
+        {
+            auto cfg = _bus.config();
+            cfg.spi_host    = SPI2_HOST;
+            cfg.spi_mode    = 0;
+            cfg.freq_write  = 27000000;
+            cfg.freq_read   = 16000000;
+            cfg.spi_3wire   = true;
+            cfg.use_lock    = true;
+            cfg.dma_channel = SPI_DMA_CH_AUTO;
+            cfg.pin_sclk    = PIN_LCD_SCLK;
+            cfg.pin_mosi    = PIN_LCD_MOSI;
+            cfg.pin_miso    = -1;
+            cfg.pin_dc      = PIN_LCD_DC;
+            _bus.config(cfg);
+            _panel.setBus(&_bus);
+        }
+        {
+            auto cfg = _panel.config();
+            cfg.pin_cs      = PIN_LCD_CS;
+            cfg.pin_rst     = PIN_LCD_RST;
+            cfg.pin_busy    = -1;
+            cfg.panel_width  = 80;
+            cfg.panel_height = 160;
+            cfg.offset_x     = 26;   // ST7735_GREENTAB160x80 colstart
+            cfg.offset_y     = 1;    // ST7735_GREENTAB160x80 rowstart
+            cfg.offset_rotation = 0;
+            cfg.dummy_read_pixel = 8;
+            cfg.dummy_read_bits  = 1;
+            cfg.readable    = false;
+            cfg.invert      = true;
+            cfg.rgb_order   = false;  // BGR
+            cfg.dlen_16bit  = false;
+            cfg.bus_shared  = false;
+            _panel.config(cfg);
+        }
+        {
+            auto cfg = _light.config();
+            cfg.pin_bl      = PIN_LCD_BL;
+            cfg.invert      = true;   // active LOW
+            cfg.freq        = 44100;
+            cfg.pwm_channel = 7;
+            _light.config(cfg);
+            _panel.setLight(&_light);
+        }
+        setPanel(&_panel);
+    }
+};
 
 // ── Colour palette — loaded from active theme via lcd_apply_theme() ───────────
 static uint16_t C_BG     = 0x0000u;
@@ -20,7 +75,7 @@ static const uint8_t  HDR_H  = 14;    // header bar height (px)
 static const uint8_t  FTR_Y  = 148;   // footer separator y
 static const uint8_t  FTR_TY = 154;   // footer text centre y
 
-static TFT_eSPI tft;
+static LGFX tft;
 static bool     s_layout_drawn   = false;  // reset by lcd_invalidate_layout() on mode switch
 static uint8_t  s_prog_last_pct  = 255;    // 255 = not yet drawn; reset by lcd_invalidate_layout()
 static char     s_prog_last_lbl[80] = "";  // cached label for partial-refresh
@@ -69,11 +124,8 @@ void lcd_apply_theme() {
 }
 
 void lcd_begin() {
-    pinMode(PIN_LCD_BL, OUTPUT);
-    digitalWrite(PIN_LCD_BL, LOW);    // backlight on (GPIO38 active-LOW)
-
-    tft.init();
-    tft.setRotation(2);               // portrait 80×160, USB plug at top
+    tft.begin();
+    tft.setRotation(0);               // portrait 80×160, USB plug at top
     lcd_apply_theme();                // sets all C_xxx vars + fills screen
 
     draw_header("Booting...");

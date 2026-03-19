@@ -61,7 +61,7 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │                     LCD UI LAYER                          │  │
-│  │  TFT_eSPI — ST7735 80×160 px                             │  │
+│  │  LovyanGFX — ST7735 80×160 px                            │  │
 │  │  Mode status / WiFi info / IP / progress bar / QR code   │  │
 │  └──────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
@@ -73,11 +73,11 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 
 | Purpose         | Library                      | Notes                              |
 |-----------------|------------------------------|------------------------------------|
-| USB MSC         | `USBMSC.h` (arduino-esp32)   | Built into Arduino Core 2.x        |
+| USB MSC         | `USBMSC.h` (arduino-esp32)   | Built into Arduino Core 3.x        |
 | HTTP Server     | mathieucarbou/ESPAsyncWebServer | Port 80, plain HTTP, async, no TLS |
 | Telegram Bot    | AsyncTelegram2 (cotestatnt)  | Non-blocking, SSL, inline keyboards |
 | HTTP Downloader | HTTPClient (built-in)        | Stream-based chunked writes to SD  |
-| LCD Driver      | TFT_eSPI (Bodmer)            | ST7735 config, fast SPI            |
+| LCD Driver      | LovyanGFX (lovyan03)         | ST7735 config, Core 3.x compatible |
 | JSON            | ArduinoJson v7               | Webhook & config parsing            |
 | Settings        | Preferences (built-in)       | NVS key-value store                 |
 | mDNS            | ESPmDNS (built-in)           | `usbdrive.local` discovery          |
@@ -86,19 +86,23 @@ filesystem; concurrent ESP32 writes cause **filesystem corruption**.
 
 ## Development Platform
 
-**PlatformIO (VS Code) with official Espressif platform `espressif32@6.12.0`**
+**PlatformIO (VS Code) with pioarduino `55.03.37` (Arduino Core 3.3.7, ESP-IDF 5.5.2)**
 
-This is the platform used by all working LilyGo T-Dongle-S3 projects (official factory
-examples, pjpmarques HelloWorld, JaredReabow 2025). TFT_eSPI works cleanly on this
-platform without any SPI register hacks.
+pioarduino enables a hybrid build mode via `custom_sdkconfig`: lwIP and other IDF components
+are compiled from source, allowing TCP window tuning, window scaling, and other settings
+that are hard-coded in the prebuilt `liblwip.a` of `espressif32@6.12.0`.
 
 ```ini
 [env:t-dongle-s3]
-platform = espressif32@6.12.0
+platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.37/platform-espressif32.zip
 board = dongles3
 framework = arduino
 board_build.partitions = partitions.csv
+extra_scripts = pre:disable_idf_comp_mgr.py
+                pre:add_idf_includes.py
 ```
+
+**First build**: ~20-40 min (IDF compiled from source). **Subsequent**: ~2-4 min (cached).
 
 ---
 
@@ -107,15 +111,20 @@ board_build.partitions = partitions.csv
 ```
 USB Server/
 ├── CLAUDE.md                 ← this file
+├── AGENTS.md                 ← multi-agent system roster and usage guide
 ├── platformio.ini
+├── add_idf_includes.py       # SCons pre-script: adds 3 pioarduino prebuilt include dirs
+├── disable_idf_comp_mgr.py   # SCons pre-script: disables IDF component manager
+├── partitions.csv
 ├── src/
 │   ├── main.cpp              # Entry point, mode manager, button handler
-│   ├── lcd.cpp / lcd.h       # TFT_eSPI wrapper, all screens, progress bar
+│   ├── lcd.cpp / lcd.h       # LovyanGFX wrapper, all screens, progress bar
 │   ├── storage.cpp / .h      # SD card mount/unmount, stats, path helpers
 │   ├── usb_drive.cpp / .h    # TinyUSB MSC setup and callbacks
+│   ├── usb_stubs.c           # Weak-symbol stubs for Core 3.x USB (pioarduino)
 │   ├── wifi_manager.cpp / .h # WiFi connect, AP fallback, captive portal, mDNS
 │   ├── web_server.cpp / .h   # HTTP server (ESPAsyncWebServer) — all routes on port 80
-│   ├── downloader.cpp / .h   # URL downloader — state machine, HTTPClient stream, LCD progress
+│   ├── downloader.cpp / .h   # URL downloader — double-buffer FreeRTOS SD task, TCP window scaling
 │   ├── actlog.cpp / .h       # Activity log — 50-entry ring buffer, GET /api/log
 │   ├── config.h              # Pin defs, NVS keys, compile-time constants
 │   └── themes.cpp / .h       # Color palettes, LCD theme apply
@@ -132,7 +141,7 @@ USB Server/
 | USB Mass Storage (Drive Mode) | `usb_drive`         | [x] Hardware verified |
 | HTTP Config Dashboard       | `web_server`          | [x] Hardware verified |
 | HTTP File Manager           | `web_server`          | [x] Hardware verified |
-| Direct URL download         | `downloader`          | [x] Done — feat/url-download, v0.4.0 |
+| Direct URL download         | `downloader`          | [x] Hardware verified — v1.4.0 |
 | LCD UI with progress bar    | `lcd`                 | [x] Done |
 | WiFi connect from web/LCD   | `wifi_manager`        | [x] Done |
 | Captive portal (first boot) | `wifi_manager`        | [x] Done |
@@ -173,7 +182,7 @@ USB Server/
 
 ### Phase 1 — Foundation `[x]` COMPLETE
 - [x] PlatformIO project created, `platformio.ini` configured for T-Dongle-S3
-- [x] TFT_eSPI LCD boots with splash screen — portrait 80×160, blink-free 15 s refresh
+- [x] LovyanGFX LCD boots with splash screen — portrait 80×160, blink-free 15 s refresh
 - [x] APA102 RGB LED working — blue=booting, orange=connecting, green=ok, red=no WiFi
 - [x] WiFi captive portal + NVS creds verified on hardware
 - [x] SD card mount verified — 29.7 GB free confirmed on hardware
@@ -206,7 +215,8 @@ USB Server/
 - [x] Concurrent request protection: portMUX spinlock + 503 busy response
 
 ### Phase 4 — Remote Control & Downloads `[~]` (partial)
-- [x] Direct URL download: submit link via web UI → LCD progress bar → file on SD
+- [x] Direct URL download: submit link via web UI → LCD progress bar → file on SD (hardware verified)
+- [x] Download performance: double-buffer FreeRTOS SD write task (Core 1, priority 5) + TCP window scaling (512 KB effective window) — eliminates burst/pause pattern
 - [ ] Download queue: multiple URLs queued, processed sequentially (FreeRTOS task)
 - [ ] LCD download queue display: progress bar + current filename
 - [ ] Telegram Bot: `/download <url>` command triggers download, bot replies with status
@@ -305,3 +315,9 @@ USB Server/
 | 3     | 2026-03-15 | **Phase 3 COMPLETE** — all core web UI features hardware-verified: config dashboard, file manager, WiFi settings, IP mode, themes, mode switch, USB↔Network bat file, button reset. |
 | 5     | 2026-03-15 | **System file filter**: `is_system_entry()` hides OS-generated entries from file listing, search, and ZIP — Windows (`System Volume Information`, `$RECYCLE.BIN`, `$*`), macOS (`._*`, `.Trashes`, `.Spotlight-V100`, `.fseventsd`), and internal temp file (`_dl_tmp.zip`). |
 | 4     | 2026-03-19 | **Direct URL download complete**: POST `/api/download`, streaming to SD via HTTPClient, LCD progress bar (partial refresh — speed/size/ETA rows update without full-screen blink), live speed (KB/s)/size/ETA on LCD and web toast, conflict modal (Replace/Skip/Cancel) with .bak backup/restore pattern, cancel button (`POST /api/dl-cancel`), activity log — `actlog.h/cpp` 50-entry ring buffer, `GET /api/log`. On-load check restores poll state after page reload mid-download. `SO_RCVBUF` setsockopt attempted for TCP window expansion but is a no-op against prebuilt `liblwip.a` in espressif32@6.12.0 (TCP_WND=5760 hardcoded); documented in sdkconfig.defaults. Bug fix: added `s_dl_cancel = false` to early-exit paths (SD not ready / SD full) to prevent stale cancel flag poisoning the next download. |
+| —     | 2026-03-19 | **Platform migration: pioarduino 55.03.37** (Arduino Core 3.3.7, ESP-IDF 5.5.2). Replaces espressif32@6.12.0. Enables lwIP source rebuild via `custom_sdkconfig`. `add_idf_includes.py` SCons pre-script adds 3 targeted prebuilt include dirs (`arduino_tinyusb/tinyusb/src`, `arduino_tinyusb/include`, `espressif__mdns/include`) to fix `tusb.h`/`mdns.h` missing on clean builds. `disable_idf_comp_mgr.py` prevents IDF component manager conflicts. `src/usb_stubs.c` adds weak-symbol stubs required by Core 3.x USB. `CMakeLists.txt` added for pioarduino cmake integration. Build: RAM 47.5%, Flash 34.3%. |
+| —     | 2026-03-19 | **LovyanGFX replaces TFT_eSPI**: `lovyan03/LovyanGFX ^1.2.0` — Core 3.x compatible, no SPI register hacks. ST7735 config migrated. `lcd.cpp` rewritten for LovyanGFX API. |
+| —     | 2026-03-19 | **Double-buffer FreeRTOS SD write task**: `sd_writer_task()` runs on Core 1 (priority 5). Two 32 KB ping-pong buffers (`s_buf[65536]`). SDMMC DMA blocks the write task on a semaphore (CPU released), allowing Arduino loop to drain TCP socket concurrently. Overlaps SD write latency with TCP reads — eliminates idle gaps in download stream. |
+| —     | 2026-03-19 | **TCP window scaling**: `CONFIG_LWIP_WND_SCALE=y` + `CONFIG_LWIP_TCP_RCV_SCALE=3` in `custom_sdkconfig`. Effective receive window: 65535 × 8 = 512 KB. At 400 KB/s, covers 1.3 s of SD write stalls without server seeing a zero-window pause — eliminates the burst/pause download pattern. |
+| —     | 2026-03-19 | **Multi-agent system**: 10 Claude Code skills in `.claude/skills/` — `master`, `orchestrate`, `architect`, `research`, `compare`, `validate`, `implement`, `debug-build`, `report`, `mem-check`. `AGENTS.md` documents roster, standard pipelines, and design principles. Invoked via `/skill-name` in Claude Code terminal. |
+| —     | 2026-03-19 | **Tagged v1.4.0** — 1=pioarduino Core 3.x baseline, 4=Phase 4 (direct URL download) complete and hardware verified. |
