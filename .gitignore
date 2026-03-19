@@ -1,6 +1,12 @@
 # PlatformIO build artifacts
 .pio/
 
+# pioarduino / ESP-IDF build artifacts
+.dummy/
+managed_components/
+sdkconfig
+build/
+
 # VSCode local settings
 .vscode/
 
