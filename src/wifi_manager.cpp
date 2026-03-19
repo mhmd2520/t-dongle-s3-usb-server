@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <esp_wifi.h>
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -108,7 +109,11 @@ bool wifi_begin(uint32_t timeout_ms) {
         Serial.printf("[WiFi] Connecting to saved SSID: %s\n", ssid.c_str());
         if (try_connect(ssid, pass, timeout_ms)) {
             g_connected = true;
-            Serial.printf("[WiFi] Connected — IP: %s\n", WiFi.localIP().toString().c_str());
+            // Disable modem sleep — prevents DTIM-driven burst/pause pattern during downloads.
+            WiFi.setSleep(false);
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            Serial.printf("[WiFi] Connected — IP: %s  (modem sleep disabled)\n",
+                          WiFi.localIP().toString().c_str());
             if (MDNS.begin(MDNS_HOST)) {
                 MDNS.addService("http", "tcp", 80);
                 Serial.printf("[mDNS] http://%s.local\n", MDNS_HOST);

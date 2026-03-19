@@ -69,8 +69,7 @@ static uint32_t crc32_feed(uint32_t state, const uint8_t* buf, size_t len) {
 // every 1 s via refreshNets() until fresh results arrive (~2-3 s scan time).
 
 static String   g_scan_cache;
-static uint32_t g_scan_ts         = 0;
-static uint32_t g_scan_trigger_ts = 0;  // 0 = triggers immediately on first loop
+static uint32_t g_scan_ts = 0;
 
 static String get_networks_html() {
     int n = WiFi.scanComplete();  // -2=running, -1=idle, >=0=results
