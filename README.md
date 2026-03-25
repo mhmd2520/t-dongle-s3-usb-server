@@ -77,8 +77,8 @@ pio device monitor
 ```
 
 On first boot with no saved WiFi credentials the device starts an AP:
-- **SSID:** `USBDrive-Config`
-- **Password:** `12345678`
+- **SSID:** `T-Dongle-S3`
+- **Password:** `configure`
 - **URL:** `http://192.168.4.1/`
 
 ## Library Stack
