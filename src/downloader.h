@@ -1,9 +1,12 @@
 #pragma once
 #include <Arduino.h>
 
-// Queue a URL for download. Called from web handler (Core 0).
-// Returns false if a download is already pending or active.
+// Add a URL to the download queue. Called from web handler (Core 0).
+// Returns false only if the queue is full (DL_QUEUE_SIZE slots).
 bool        downloader_queue(const char* url);
+
+// Number of URLs waiting in queue (not counting the actively-running download).
+int         downloader_queue_count();
 
 // True while a download is in progress (Core 1 stream loop).
 bool        downloader_is_busy();
@@ -36,7 +39,10 @@ bool        downloader_conflict_pending();
 // Name of the conflicting file (valid only when downloader_conflict_pending()).
 const char* downloader_conflict_name();
 
-// Resolve a pending conflict.  action = "replace" | "skip" | "cancel"
+// Resolve a pending conflict.
+//   "replace"  → overwrite existing file (original backed up as .bak, restored on failure)
+//   "skip"     → "Keep Both": download to a numbered filename (file_1.ext, file_2.ext…)
+//   "cancel"   → abort download and discard partial file
 void        downloader_resolve(const char* action);
 
 // Execute pending download. Must be called from main loop (Core 1) only.

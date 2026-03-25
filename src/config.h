@@ -23,7 +23,7 @@
 // ============================================================
 
 #define DEVICE_NAME   "USB Drive"
-#define FW_VERSION    "0.1.0"
+#define FW_VERSION    "1.4.1"
 #define MDNS_HOST     "usbdrive"    // → http://usbdrive.local
 
 // ============================================================

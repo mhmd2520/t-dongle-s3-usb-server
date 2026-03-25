@@ -47,22 +47,26 @@ Run each agent in sequence. Pass outputs forward as context. Stop and escalate t
 
 ## Step 4 — Final Report
 
-After the pipeline completes, output:
+After the pipeline completes, output a concise report — aim for clarity over completeness:
 
 ```
-## Master Report: [request summary]
+## ✅ [feature name] — [Success / Partial / Blocked]
 
-### What was done
-- [Agent]: [outcome]
+**What changed:** 1-2 sentences summarising the change.
 
-### Result
-[Success / Partial / Blocked — with explanation]
+**Files:** `file1`, `file2`, `file3`
 
-### Files changed
-- [file]: [what changed]
+**Flow:**
+User does X → firmware does Y → LCD shows Z → file lands on SD.
+(One short paragraph, plain language, no bullet overload.)
 
-### Next steps (if any)
-- [...]
+**Test:**
+1. Precondition
+2. Do X → expect Y
+3. Do X → expect Y
+(3-5 steps max. Only what's needed to verify on hardware.)
+
+**Next:** [next logical step, if any]
 ```
 
 ---
