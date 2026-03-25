@@ -24,6 +24,21 @@ Keep project documentation accurate and current. Update CLAUDE.md and any other 
 | phase | YYYY-MM-DD | Brief description of what changed and why |
 ```
 
+## Output Format (for feature implementations)
+After a feature implementation, output a short report — aim for clarity over completeness:
+
+```
+## ✅ [feature name] — [Success / Partial / Blocked]
+
+**What changed:** 1-2 sentences max.
+**Files:** `file1`, `file2`
+**Flow:** User does X → firmware does Y → LCD shows Z. (One paragraph, plain language.)
+**Test:**
+1. Precondition
+2. Do X → expect Y  (3-5 steps max)
+**Next:** [one line]
+```
+
 ## Rules
 - Today's date: use the `currentDate` from context
 - Be specific: mention module names, function names, config keys
