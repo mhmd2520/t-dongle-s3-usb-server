@@ -81,6 +81,11 @@ static uint8_t  s_prog_last_pct  = 255;    // 255 = not yet drawn; reset by lcd_
 static char     s_prog_last_lbl[80] = "";  // cached label for partial-refresh
 static int      s_prog_last_spd  = -2;     // -2 = never drawn
 static int32_t  s_prog_last_byt  = -1;
+static int      s_prog_last_queue = -1;    // cached queue_remaining for header partial-refresh
+static char     s_prog_last_hdr[20]  = ""; // cached header string for partial-refresh
+static char     s_prog_last_size[18] = ""; // cached size row string — skip SPI if unchanged
+static char     s_prog_last_spds[18] = ""; // cached speed row string
+static char     s_prog_last_eta[18]  = ""; // cached ETA row string
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -154,22 +159,52 @@ void lcd_splash_msg(const char* msg) {
 
 void lcd_show_status(bool wifi_ok, bool ap_mode, const String& ip,
                      bool sd_ok, float sd_free_gb, float sd_total_gb) {
-    // Read IP mode config from NVS (read-only, fast)
-    Preferences wP;
-    wP.begin("wifi", true);
-    uint8_t ip_mode = wP.getUChar("ip_mode", 0);
-    String  s_mask  = (ip_mode == 1) ? wP.getString("s_mask", "255.255.255.0") : "";
-    String  s_gw    = (ip_mode == 1) ? wP.getString("s_gw",   "") : "";
-    wP.end();
+    // Read IP mode config from NVS — cached after first read so NVS is only
+    // accessed when the mode actually changes, not every 15-second refresh.
+    static uint8_t s_last_ip_mode = 255;
+    static String  s_mask_cache;
+    static String  s_gw_cache;
+    static bool    s_last_ap = false;
+
+    // ip_mode / mask / gw only change after a WiFi-save restart — cache after first read,
+    // never touch NVS again until lcd_invalidate_layout() resets s_last_ip_mode to 255.
+    uint8_t ip_mode;
+    if (s_last_ip_mode == 255) {
+        Preferences wP;
+        wP.begin("wifi", true);
+        ip_mode = wP.getUChar("ip_mode", 0);
+        if (ip_mode == 1) {
+            s_mask_cache = wP.getString("s_mask", "255.255.255.0");
+            s_gw_cache   = wP.getString("s_gw",   "");
+        } else {
+            s_mask_cache = "";
+            s_gw_cache   = "";
+        }
+        wP.end();
+    } else {
+        ip_mode = s_last_ip_mode;  // cached — no NVS I/O
+    }
+    const String& s_mask = s_mask_cache;
+    const String& s_gw   = s_gw_cache;
 
     // Invalidate cached layout when AP↔STA or ip_mode changes.
-    static bool    s_last_ap      = false;
-    static uint8_t s_last_ip_mode = 255;
     if (ap_mode != s_last_ap || ip_mode != s_last_ip_mode) {
         s_layout_drawn = false;
         s_last_ap      = ap_mode;
         s_last_ip_mode = ip_mode;
     }
+
+    // Value cache — skip SPI writes when nothing has changed since last refresh.
+    static bool   s_last_wifi_ok  = false;
+    static bool   s_last_sd_ok    = false;
+    static float  s_last_free_gb  = -1.0f;
+    static float  s_last_total_gb = -1.0f;
+    static String s_last_ip;
+    bool values_changed = s_layout_drawn == false  // layout invalidated → force
+                       || wifi_ok    != s_last_wifi_ok
+                       || sd_ok      != s_last_sd_ok
+                       || sd_free_gb != s_last_free_gb
+                       || ip         != s_last_ip;
 
     // First call (or after invalidation): draw static chrome + labels.
     if (!s_layout_drawn) {
@@ -197,6 +232,8 @@ void lcd_show_status(bool wifi_ok, bool ap_mode, const String& ip,
         draw_footer("BOOT: switch");
         s_layout_drawn = true;
     }
+
+    if (!values_changed) return;   // nothing to repaint — skip all SPI writes
 
     tft.setTextSize(1);
     tft.setTextDatum(ML_DATUM);
@@ -273,6 +310,13 @@ void lcd_show_status(bool wifi_ok, bool ap_mode, const String& ip,
             tft.drawString("Not found", 3, 74);
         }
     }
+
+    // Update value cache
+    s_last_wifi_ok  = wifi_ok;
+    s_last_sd_ok    = sd_ok;
+    s_last_free_gb  = sd_free_gb;
+    s_last_total_gb = sd_total_gb;
+    s_last_ip       = ip;
 }
 
 // Format "X.X/Y.YMB" or "X/YKB" or "X.XMB" (unknown total).  buf must be ≥18 bytes.
@@ -313,7 +357,8 @@ static void fmt_eta(char* buf, int len, int speed_kbps, int32_t recv, int total)
 }
 
 void lcd_show_progress(const String& label, uint8_t percent,
-                       int speed_kbps, int32_t bytes_recv, int content_len) {
+                       int speed_kbps, int32_t bytes_recv, int content_len,
+                       int queue_remaining, const char* header) {
     const uint8_t BAR_X = 10;
     const uint8_t BAR_Y = 70;
     const uint8_t BAR_W = LCD_W - 20;
@@ -322,9 +367,22 @@ void lcd_show_progress(const String& label, uint8_t percent,
     bool label_changed = (strncmp(label.c_str(), s_prog_last_lbl, sizeof(s_prog_last_lbl) - 1) != 0);
     bool first_draw    = (s_prog_last_pct == 255) || label_changed;
 
+    // ── Build header string (shared by first_draw and queue-change redraw) ───────
+    auto make_hdr = [&](char* buf, size_t bufsz) {
+        if (header != nullptr)        strncpy(buf, header, bufsz - 1), buf[bufsz-1] = '\0';
+        else if (queue_remaining > 0) snprintf(buf, bufsz, "DL +%d queued", queue_remaining);
+        else                          strncpy(buf, "Downloading", bufsz);
+    };
+
     if (first_draw) {
         // Full redraw: chrome + static elements
-        draw_header("Downloading");
+        // "DL +999 queued\0" = 16 bytes — assert ensures hdr[20] fits up to 3-digit queue counts.
+        static_assert(sizeof("DL +999 queued") <= 20, "hdr[] too small for max queue count");
+        char hdr[20]; make_hdr(hdr, sizeof(hdr));
+        draw_header(hdr);
+        s_prog_last_queue = queue_remaining;
+        strncpy(s_prog_last_hdr, hdr, sizeof(s_prog_last_hdr) - 1);
+        s_prog_last_hdr[sizeof(s_prog_last_hdr) - 1] = '\0';
         clear_content();
         tft.setTextDatum(MC_DATUM);
         tft.setTextSize(1);
@@ -334,6 +392,18 @@ void lcd_show_progress(const String& label, uint8_t percent,
         strncpy(s_prog_last_lbl, label.c_str(), sizeof(s_prog_last_lbl) - 1);
         s_prog_last_lbl[sizeof(s_prog_last_lbl) - 1] = '\0';
         s_prog_last_pct = 255;   // force bar + text update below
+    }
+
+    // Redraw header when queue count or header string changes (after first_draw handled it above)
+    if (!first_draw) {
+        char hdr[20]; make_hdr(hdr, sizeof(hdr));
+        if (queue_remaining != s_prog_last_queue ||
+            strncmp(hdr, s_prog_last_hdr, sizeof(s_prog_last_hdr)) != 0) {
+            draw_header(hdr);
+            s_prog_last_queue = queue_remaining;
+            strncpy(s_prog_last_hdr, hdr, sizeof(s_prog_last_hdr) - 1);
+            s_prog_last_hdr[sizeof(s_prog_last_hdr) - 1] = '\0';
+        }
     }
 
     if (percent != s_prog_last_pct) {
@@ -353,7 +423,9 @@ void lcd_show_progress(const String& label, uint8_t percent,
         s_prog_last_pct = percent;
     }
 
-    // Speed / size / ETA rows — update whenever values change
+    // Speed / size / ETA rows — update only the rows whose string representation changed.
+    // Each row costs 2 SPI transactions (fillRect erase + drawString); skipping unchanged
+    // rows halves typical SPI overhead during a download (size changes infrequently).
     bool stats_changed = first_draw ||
                          (speed_kbps != s_prog_last_spd) ||
                          (bytes_recv != s_prog_last_byt);
@@ -364,21 +436,33 @@ void lcd_show_progress(const String& label, uint8_t percent,
 
         // Row 1 (y=100..112): received / total size
         fmt_size(sbuf, sizeof(sbuf), bytes_recv, content_len);
-        tft.fillRect(0, 100, LCD_W, 13, C_BG);
-        tft.setTextColor(C_TEXT, C_BG);
-        tft.drawString(sbuf, LCD_W / 2, 107);
+        if (strncmp(sbuf, s_prog_last_size, sizeof(sbuf)) != 0) {
+            tft.fillRect(0, 100, LCD_W, 13, C_BG);
+            tft.setTextColor(C_TEXT, C_BG);
+            tft.drawString(sbuf, LCD_W / 2, 107);
+            strncpy(s_prog_last_size, sbuf, sizeof(s_prog_last_size) - 1);
+            s_prog_last_size[sizeof(s_prog_last_size) - 1] = '\0';
+        }
 
         // Row 2 (y=113..125): download speed
         fmt_speed(sbuf, sizeof(sbuf), speed_kbps);
-        tft.fillRect(0, 113, LCD_W, 13, C_BG);
-        tft.setTextColor(C_ACCENT, C_BG);
-        tft.drawString(sbuf, LCD_W / 2, 120);
+        if (strncmp(sbuf, s_prog_last_spds, sizeof(sbuf)) != 0) {
+            tft.fillRect(0, 113, LCD_W, 13, C_BG);
+            tft.setTextColor(C_ACCENT, C_BG);
+            tft.drawString(sbuf, LCD_W / 2, 120);
+            strncpy(s_prog_last_spds, sbuf, sizeof(s_prog_last_spds) - 1);
+            s_prog_last_spds[sizeof(s_prog_last_spds) - 1] = '\0';
+        }
 
         // Row 3 (y=126..138): remaining time (only when size is known)
         fmt_eta(sbuf, sizeof(sbuf), speed_kbps, bytes_recv, content_len);
-        tft.fillRect(0, 126, LCD_W, 13, C_BG);
-        tft.setTextColor(C_DIM, C_BG);
-        tft.drawString(sbuf, LCD_W / 2, 133);
+        if (strncmp(sbuf, s_prog_last_eta, sizeof(sbuf)) != 0) {
+            tft.fillRect(0, 126, LCD_W, 13, C_BG);
+            tft.setTextColor(C_WARN, C_BG);
+            tft.drawString(sbuf, LCD_W / 2, 133);
+            strncpy(s_prog_last_eta, sbuf, sizeof(s_prog_last_eta) - 1);
+            s_prog_last_eta[sizeof(s_prog_last_eta) - 1] = '\0';
+        }
 
         s_prog_last_spd = speed_kbps;
         s_prog_last_byt = bytes_recv;
@@ -412,7 +496,7 @@ void lcd_show_usb_mode(bool sd_ok, float sd_free_gb, float sd_total_gb) {
     tft.drawString("WiFi: OFF", 3, 68);
 
     tft.setTextColor(C_WARN, C_BG);
-    tft.drawString(".bat or BOOT:", 3, 82);
+    tft.drawString(".vbs or BOOT:", 3, 82);
     tft.drawString("switch to net", 3, 94);
 
     draw_footer("BOOT: switch");
@@ -424,6 +508,11 @@ void lcd_invalidate_layout() {
     s_prog_last_lbl[0] = '\0';
     s_prog_last_spd   = -2;
     s_prog_last_byt   = -1;
+    s_prog_last_queue = -1;
+    s_prog_last_hdr[0]  = '\0';
+    s_prog_last_size[0] = '\0';
+    s_prog_last_spds[0] = '\0';
+    s_prog_last_eta[0]  = '\0';
 }
 
 void lcd_set_backlight(uint8_t brightness) {

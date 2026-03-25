@@ -29,6 +29,7 @@ Diagnose build/upload failures and fix them. You have full tool access.
 6. Apply fix, rebuild, verify
 
 ## Environment
-- Build command: `PYTHONIOENCODING=utf-8 PYTHONUTF8=1 ~/.platformio/penv/Scripts/platformio run --target upload`
+- Build command: `~/.platformio/penv/Scripts/pio.exe run`
+- Upload: user handles manually — do NOT run `pio run --target upload` (crashes on Windows CP1252)
 - Platform: pioarduino hybrid build (custom_sdkconfig triggers ESP-IDF source compile — first build 20-40 min)
 - Key scripts: `pre:disable_idf_comp_mgr.py`, `pre:add_idf_includes.py`

@@ -112,17 +112,19 @@ void setup() {
         }
 
         // Always recreate the Network Mode switch script so content stays current.
-        // Double-clicking this bat writes SWITCH_TO_NETWORK to the SD; Windows FAT32
-        // lazy-flushes the write to the device in ~20 s, triggering on_write magic-bytes
-        // detection which immediately restarts into Network Mode.
+        // VBScript (.vbs) runs via wscript.exe — no console window appears.
+        // It writes SWITCH_TO_NETWORK to _switch_network.txt on the SD root.
+        // Windows FAT32 lazy-flushes the write to the device in ~20 s, triggering
+        // on_write magic-bytes detection which immediately restarts into Network Mode.
         if (g_sd_ok) {
-            File bf = SD_MMC.open("/Switch_to_Network_Mode.bat", FILE_WRITE);
+            // Remove legacy .bat file from older firmware so it doesn't confuse users.
+            SD_MMC.remove("/Switch_to_Network_Mode.bat");
+            File bf = SD_MMC.open("/Switch_to_Network_Mode.vbs", FILE_WRITE);
             if (bf) {
-                bf.print("@echo off\r\n");
-                bf.print("echo Switching USB Smart Drive to Network Mode...\r\n");
-                bf.print("echo Device will restart in Network Mode in ~20 seconds.\r\n");
-                bf.print("echo SWITCH_TO_NETWORK > \"%~d0\\_switch_network.txt\"\r\n");
-                bf.print("pause\r\n");
+                bf.print("Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n");
+                bf.print("Set f = fso.CreateTextFile(Left(WScript.ScriptFullName,3) & \"_switch_network.txt\", True)\r\n");
+                bf.print("f.Write \"SWITCH_TO_NETWORK\"\r\n");
+                bf.print("f.Close\r\n");
                 bf.close();
             }
         }
@@ -165,12 +167,16 @@ void loop() {
         wifi_portal_loop();    // DNS captive-portal redirect in AP mode (no-op in STA)
         web_server_loop();
         downloader_run();      // execute pending URL download (blocks loop during transfer)
-        if (millis() - g_last_refresh > 15000) {
-            if (!downloader_is_busy()) {
-                refresh_status();
-            } else {
-                g_last_refresh = millis();   // defer — downloader is using LCD
-            }
+
+        // Immediate LCD refresh when a download finishes (transition busy→idle).
+        static bool s_was_dl_busy = false;
+        bool dl_busy = downloader_is_busy();
+        if (s_was_dl_busy && !dl_busy) refresh_status();
+        s_was_dl_busy = dl_busy;
+
+        // Periodic 15 s refresh — skip while download is active (it owns the LCD).
+        if (!dl_busy && millis() - g_last_refresh > 15000) {
+            refresh_status();
         }
     }
     // USB Drive Mode: magic-bytes trigger (bat file) → switch to Network Mode immediately.
