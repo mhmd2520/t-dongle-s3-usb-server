@@ -14,7 +14,8 @@
 #define DL_FNAME_MAX   63
 #define DL_HALF_SIZE  32768  // each ping-pong buffer half (32 KB)
 #define DL_BUF_SIZE   65536  // total buffer: two DL_HALF_SIZE halves for double-buffering
-#define DL_LCD_EVERY  65536  // update LCD every 64 KB received
+#define DL_LCD_EVERY    16384  // update LCD every 16 KB received
+#define DL_QUEUE_SIZE  10    // max URLs waiting in queue
 
 // ── SD write task — runs on Core 1 alongside Arduino loop ─────────────────────
 // During SDMMC DMA, the task blocks on a FreeRTOS semaphore (CPU released),
@@ -37,9 +38,17 @@ static void sd_writer_task(void*) {
     vTaskDelete(nullptr);
 }
 
-// ── State (volatile fields are read by Core 0 via API handlers) ───────────────
-static volatile bool    s_dl_pending       = false;   // Core 0 sets, Core 1 clears
+// ── Download queue — ring buffer, protected by spinlock (Core 0 writes, Core 1 reads) ──
+static portMUX_TYPE     s_q_mux     = portMUX_INITIALIZER_UNLOCKED;
+static char             s_dl_queue[DL_QUEUE_SIZE][DL_URL_MAX + 1];
+static int              s_dl_q_head = 0;             // next slot to dequeue (Core 1)
+static int              s_dl_q_tail = 0;             // next slot to enqueue (Core 0)
+static volatile int     s_dl_q_count = 0;            // items waiting (read from both cores)
+
+// Working URL for the download currently in progress (Core 1 only)
 static char             s_dl_url[DL_URL_MAX + 1];
+
+// ── State (volatile fields are read by Core 0 via API handlers) ───────────────
 static volatile bool    s_dl_active        = false;
 static volatile bool    s_dl_cancel        = false;   // Core 0 sets → Core 1 aborts
 static volatile uint8_t s_dl_conflict      = 0;       // 0=none,1=waiting,2=replace,3=skip,4=cancel
@@ -125,24 +134,48 @@ static String quick_filename(const char* url) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 bool downloader_queue(const char* url) {
-    if (s_dl_active || s_dl_pending) return false;
-    strncpy(s_dl_url, url, DL_URL_MAX);
-    s_dl_url[DL_URL_MAX] = '\0';
-    __asm__ volatile ("" ::: "memory");   // compiler barrier — write data before flag
-    s_dl_pending = true;
-    return true;
+    bool ok = false;
+    taskENTER_CRITICAL(&s_q_mux);
+    if (s_dl_q_count < DL_QUEUE_SIZE) {
+        strncpy(s_dl_queue[s_dl_q_tail], url, DL_URL_MAX);
+        s_dl_queue[s_dl_q_tail][DL_URL_MAX] = '\0';
+        s_dl_q_tail = (s_dl_q_tail + 1) % DL_QUEUE_SIZE;
+        s_dl_q_count = s_dl_q_count + 1;
+        ok = true;
+    }
+    taskEXIT_CRITICAL(&s_q_mux);
+    return ok;
+}
+
+int downloader_queue_count() {
+    // Read inside critical section — Xtensa 32-bit aligned reads are atomic
+    // in practice, but the critical section prevents the compiler from splitting
+    // the read across two instructions on future compiler versions.
+    taskENTER_CRITICAL(&s_q_mux);
+    int n = s_dl_q_count;
+    taskEXIT_CRITICAL(&s_q_mux);
+    return n;
 }
 
 bool downloader_is_busy() {
-    return s_dl_active || s_dl_pending;
+    taskENTER_CRITICAL(&s_q_mux);
+    bool busy = s_dl_active || s_dl_q_count > 0;
+    taskEXIT_CRITICAL(&s_q_mux);
+    return busy;
 }
 
 void downloader_cancel() {
-    if (s_dl_active || s_dl_pending) {
-        s_dl_pending = false;
-        s_dl_cancel  = true;
-        if (s_dl_conflict == 1) s_dl_conflict = 4;  // unblock conflict wait
-    }
+    // Clear the entire queue and cancel the active download.
+    taskENTER_CRITICAL(&s_q_mux);
+    s_dl_q_count = 0;
+    s_dl_q_head  = 0;
+    s_dl_q_tail  = 0;
+    bool was_active = s_dl_active;   // read under same lock as queue state — prevents TOCTOU
+    // Set cancel flags while still inside the lock so Core 1 cannot dequeue a new URL
+    // in the window between EXIT_CRITICAL and the stores (TOCTOU fix).
+    if (was_active) s_dl_cancel = true;
+    if (s_dl_conflict == 1) s_dl_conflict = 4;  // unblock conflict wait
+    taskEXIT_CRITICAL(&s_q_mux);
 }
 
 bool downloader_conflict_pending() {
@@ -187,12 +220,19 @@ const char* downloader_status() {
 // ── Main download state machine (Core 1 only) ─────────────────────────────────
 
 void downloader_run() {
-    if (!s_dl_pending) return;
+    if (s_dl_active) return;   // Core 1 is sole writer of s_dl_active — safe outside lock
 
-    // Claim the work
-    s_dl_pending       = false;
-    if (s_dl_active) return;   // safety guard
-    s_dl_active        = true;
+    // Dequeue next URL atomically; set s_dl_active inside the lock so
+    // downloader_cancel() and downloader_is_busy() see a consistent (active, count) pair.
+    taskENTER_CRITICAL(&s_q_mux);
+    if (s_dl_q_count == 0) { taskEXIT_CRITICAL(&s_q_mux); return; }
+    strncpy(s_dl_url, s_dl_queue[s_dl_q_head], DL_URL_MAX);
+    s_dl_url[DL_URL_MAX] = '\0';
+    s_dl_q_head  = (s_dl_q_head + 1) % DL_QUEUE_SIZE;
+    s_dl_q_count = s_dl_q_count - 1;
+    s_dl_active  = true;   // set while locked — atomic view from Core 0
+    taskEXIT_CRITICAL(&s_q_mux);
+
     s_dl_progress      = 0;
     s_dl_speed_kbps    = 0;
     s_dl_bytes_recv    = 0;
@@ -239,34 +279,54 @@ void downloader_run() {
         uint8_t res = s_dl_conflict;
         s_dl_conflict = 0;
 
-        if (res == 3) {  // Skip
-            snprintf(s_dl_status, sizeof(s_dl_status), "skipped");
-            s_dl_active = false;
-            lcd_invalidate_layout();
-            actlog_add(ACT_SKIP, s_dl_filename, "Skipped (file exists)");
-            return;
-        }
-        if (res != 2) {  // Cancel or timeout
+        if (res == 3) {  // "Keep Both" — download to a numbered filename (_1, _2, ...)
+            String fn  = String(s_dl_filename);
+            int    dot = fn.lastIndexOf('.');
+            String base = dot > 0 ? fn.substring(0, dot) : fn;
+            String ext  = dot > 0 ? fn.substring(dot)    : String();
+            bool found = false;
+            for (int seq = 1; seq <= 999; seq++) {
+                sdpath = "/" + base + "_" + String(seq) + ext;
+                if (!SD_MMC.exists(sdpath.c_str())) { found = true; break; }
+            }
+            if (!found) {
+                snprintf(s_dl_status, sizeof(s_dl_status), "skipped");
+                s_dl_active = false;
+                lcd_invalidate_layout();
+                actlog_add(ACT_SKIP, s_dl_filename, "Skipped (too many copies)");
+                return;
+            }
+            // Update active filename so LCD/status reflect the new name
+            String newname = sdpath.substring(1);
+            strncpy(s_dl_filename, newname.c_str(), DL_FNAME_MAX);
+            s_dl_filename[DL_FNAME_MAX] = '\0';
+            // fall through — download proceeds to new sdpath
+        } else if (res != 2) {  // Cancel or timeout
             s_dl_cancel = false;
             snprintf(s_dl_status, sizeof(s_dl_status), "cancelled");
             s_dl_active = false;
             lcd_invalidate_layout();
-            actlog_add(ACT_CANCEL, s_dl_filename, "Cancelled");
+            actlog_add(ACT_CANCEL, s_dl_filename, "Cancelled (conflict)");
             return;
-        }
-        // res == 2: Replace — rename original to .bak so it can be restored on failure
-        backup_path = sdpath + "._bak";
-        SD_MMC.remove(backup_path.c_str());   // remove stale .bak if present
-        if (SD_MMC.rename(sdpath.c_str(), backup_path.c_str())) {
-            is_replace = true;
         } else {
-            // rename failed — fall back to direct delete
-            SD_MMC.remove(sdpath.c_str());
+            // res == 2: Replace — rename original to .bak so it can be restored on failure
+            backup_path = sdpath + "._bak";
+            SD_MMC.remove(backup_path.c_str());   // remove stale .bak if present
+            if (SD_MMC.rename(sdpath.c_str(), backup_path.c_str())) {
+                is_replace = true;
+            } else {
+                // rename failed — fall back to direct delete
+                SD_MMC.remove(sdpath.c_str());
+            }
         }
     }
 
-    // First LCD paint
-    lcd_show_progress(s_dl_filename, 0);
+    // Show "Connecting..." on LCD + status while http.GET() blocks
+    // (DNS resolution + TCP connect + TLS handshake can take 0.5–3 s)
+    snprintf(s_dl_status, sizeof(s_dl_status), "connecting");
+    lcd_show_progress(String(s_dl_filename), 0, -1, 0, -1,
+                      downloader_queue_count(), "Connecting...");
+    uint32_t dl_start_ms = millis();   // for avg-speed actlog detail
 
     // ── Open HTTP connection ───────────────────────────────────────────────────
     HTTPClient http;
@@ -313,6 +373,9 @@ void downloader_run() {
     int content_len = http.getSize();
     bool known_size = (content_len > 0);
     s_dl_content_len = content_len;
+    snprintf(s_dl_status, sizeof(s_dl_status), "downloading");
+    // Clear "Connecting..." from LCD immediately — don't wait for DL_LCD_EVERY bytes
+    lcd_show_progress(String(s_dl_filename), 0, -1, 0, content_len, downloader_queue_count());
 
     // ── Open SD file ──────────────────────────────────────────────────────────
     File outf = SD_MMC.open(sdpath.c_str(), FILE_WRITE);
@@ -389,8 +452,8 @@ void downloader_run() {
                 if (avail <= 0) break;
                 int n = stream->readBytes(rd_buf + rd_fill, avail < space ? avail : space);
                 if (n <= 0) break;
-                rd_fill += n;
-                space   -= n;
+                rd_fill   += n;
+                space     -= n;
             }
         }
 
@@ -400,7 +463,9 @@ void downloader_run() {
         bool have_all  = known_size &&
                          (bytes_recv + in_flight + rd_fill) >= (int32_t)content_len;
 
-        // Submit rd_buf for writing when half-full, stream done, or all bytes in hand.
+        // Submit rd_buf when the half-buffer fills, stream is done, or all bytes are in hand.
+        // Using DL_HALF_SIZE (32 KB) as threshold: blocks every ~80 ms at 400 KB/s instead
+        // of every ~10 ms with DL_SUBMIT_THRESH=4096, reducing blocking overhead by ~8×.
         if (rd_fill > 0 && (rd_fill >= DL_HALF_SIZE || stream_done || have_all)) {
             // Wait (blocking) for any in-flight write to complete first
             if (wr_pending) {
@@ -443,7 +508,8 @@ void downloader_run() {
                 last_lcd = visible;
                 lcd_show_progress(s_dl_filename,
                                   known_size ? (uint8_t)s_dl_progress : 0,
-                                  s_dl_speed_kbps, visible, content_len);
+                                  s_dl_speed_kbps, visible, content_len,
+                                  downloader_queue_count());
             }
         }
 
@@ -496,7 +562,12 @@ void downloader_run() {
         snprintf(s_dl_status, sizeof(s_dl_status), "cancelled");
         s_dl_active = false;
         lcd_invalidate_layout();
-        actlog_add(ACT_CANCEL, s_dl_filename, "Cancelled");
+        {
+            char det[48];
+            if (bytes_recv >= 1024) snprintf(det, sizeof(det), "Cancelled @ %d KB", (int)(bytes_recv / 1024));
+            else                    strncpy(det, "Cancelled", sizeof(det));
+            actlog_add(ACT_CANCEL, s_dl_filename, det);
+        }
         Serial.printf("[DL] Cancelled: /%s\n", s_dl_filename);
         return;
     }
@@ -504,24 +575,33 @@ void downloader_run() {
     // ── Error: SD write failure ───────────────────────────────────────────────
     if (write_err) {
         SD_MMC.remove(sdpath.c_str());
-        if (is_replace) SD_MMC.rename(backup_path.c_str(), sdpath.c_str());  // restore original
+        if (is_replace) SD_MMC.rename(backup_path.c_str(), sdpath.c_str());
         snprintf(s_dl_status, sizeof(s_dl_status), "error: write failed");
         s_dl_active = false;
         lcd_invalidate_layout();
-        actlog_add(ACT_WARN, s_dl_filename, "Write error");
+        {
+            char det[48];
+            snprintf(det, sizeof(det), "Write error @ %d KB", (int)(bytes_recv / 1024));
+            actlog_add(ACT_WARN, s_dl_filename, det);
+        }
         return;
     }
 
     // ── Error: truncated response ─────────────────────────────────────────────
     if (known_size && bytes_recv < (int32_t)content_len) {
         SD_MMC.remove(sdpath.c_str());
-        if (is_replace) SD_MMC.rename(backup_path.c_str(), sdpath.c_str());  // restore original
+        if (is_replace) SD_MMC.rename(backup_path.c_str(), sdpath.c_str());
         snprintf(s_dl_status, sizeof(s_dl_status),
                  "error: incomplete (%d/%d B)", (int)bytes_recv, content_len);
-        s_dl_cancel = false;   // clear stale cancel flag (mirrors early-exit paths)
+        s_dl_cancel = false;
         s_dl_active = false;
         lcd_invalidate_layout();
-        actlog_add(ACT_WARN, s_dl_filename, "Incomplete download");
+        {
+            char det[48];
+            snprintf(det, sizeof(det), "Incomplete %d/%d KB",
+                     (int)(bytes_recv / 1024), (int)(content_len / 1024));
+            actlog_add(ACT_WARN, s_dl_filename, det);
+        }
         return;
     }
 
@@ -529,15 +609,23 @@ void downloader_run() {
     if (is_replace) SD_MMC.remove(backup_path.c_str());  // discard backup — new file is good
     s_dl_progress = 100;
     snprintf(s_dl_status, sizeof(s_dl_status), "done");
-    lcd_show_progress(s_dl_filename, 100);
+    lcd_show_progress(s_dl_filename, 100, -1, 0, -1, 0);
     delay(800);
     lcd_invalidate_layout();
     s_dl_active = false;
 
     {
-        char dl_detail[32];
-        if (bytes_recv >= 1048576) snprintf(dl_detail, sizeof(dl_detail), "%.1f MB", bytes_recv / 1048576.0f);
-        else                       snprintf(dl_detail, sizeof(dl_detail), "%d KB",   (int)(bytes_recv / 1024));
+        char dl_detail[48];
+        uint32_t elapsed = millis() - dl_start_ms;
+        int avg_kbps = (elapsed > 0) ? (int)((int64_t)bytes_recv * 1000 / elapsed / 1024) : -1;
+        char size_buf[16], spd_buf[16];
+        if (bytes_recv >= 1048576) snprintf(size_buf, sizeof(size_buf), "%.1f MB", bytes_recv / 1048576.0f);
+        else                       snprintf(size_buf, sizeof(size_buf), "%d KB",   (int)(bytes_recv / 1024));
+        if (avg_kbps >= 1024)      snprintf(spd_buf, sizeof(spd_buf), "%.1f MB/s", avg_kbps / 1024.0f);
+        else if (avg_kbps >= 0)    snprintf(spd_buf, sizeof(spd_buf), "%d KB/s", avg_kbps);
+        else                       spd_buf[0] = '\0';
+        if (spd_buf[0]) snprintf(dl_detail, sizeof(dl_detail), "%s @ %s", size_buf, spd_buf);
+        else            snprintf(dl_detail, sizeof(dl_detail), "%s", size_buf);
         actlog_add(ACT_DL, s_dl_filename, dl_detail);
     }
     Serial.printf("[DL] Done: /%s (%d bytes)\n", s_dl_filename, (int)bytes_recv);

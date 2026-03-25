@@ -23,8 +23,11 @@ void lcd_show_status(bool wifi_ok, bool ap_mode, const String& ip,
 //   speed_kbps  – current KB/s; -1 = not yet sampled
 //   bytes_recv  – bytes received so far (for size display)
 //   content_len – total bytes from Content-Length; -1 if unknown
+// header: overrides the default "Downloading" / "DL +N queued" header text.
+//         Pass "PC Download" for SD→PC, "PC Upload" for browser→SD, etc.
 void lcd_show_progress(const String& label, uint8_t percent,
-                       int speed_kbps = -1, int32_t bytes_recv = 0, int content_len = -1);
+                       int speed_kbps = -1, int32_t bytes_recv = 0, int content_len = -1,
+                       int queue_remaining = 0, const char* header = nullptr);
 
 // USB Drive Mode status screen — call after usb_drive_begin().
 //   sd_ok        — true if SD card is mounted and passed to MSC
