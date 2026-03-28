@@ -151,6 +151,15 @@ void setup() {
             led_set(80, 40, 0);  // orange = AP mode (no router)
         }
 
+        // Show QR code for 5 s after boot — phone camera → web UI, no typing needed.
+        // Displayed before the normal status screen to give users a quick access shortcut.
+        {
+            String qr_url = "http://" + wifi_ip();
+            lcd_show_qr(qr_url.c_str());
+            delay(5000);
+            lcd_invalidate_layout();   // force full status-screen redraw after QR
+        }
+
         // Unified status page — shows STA IP when connected, AP name/pass/IP
         // when in AP config mode.  Never blank after wifi_begin() returns.
         lcd_show_status(g_wifi_ok, wifi_is_ap_mode(), wifi_ip(),

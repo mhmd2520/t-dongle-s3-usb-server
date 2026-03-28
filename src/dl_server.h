@@ -9,3 +9,5 @@
 
 void dl_server_begin();
 void dl_server_loop();
+// Called by web_server when auth credentials change, so port 8080 re-reads NVS.
+void dl_auth_cache_invalidate();

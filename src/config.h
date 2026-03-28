@@ -23,7 +23,7 @@
 // ============================================================
 
 #define DEVICE_NAME   "USB Drive"
-#define FW_VERSION    "1.4.1"
+#define FW_VERSION    "1.5.0"
 #define MDNS_HOST     "usbdrive"    // → http://usbdrive.local
 
 // ============================================================
@@ -78,3 +78,5 @@ enum AppMode { MODE_NETWORK = 0, MODE_USB_DRIVE = 1 };
 #define NVS_NS            "usbdrive"
 #define NVS_KEY_MODE      "mode"      // uint8_t — stores AppMode value
 #define NVS_KEY_THEME     "theme"     // uint8_t — LCD colour theme index
+#define NVS_KEY_AUTH_USER "auth_u"    // string  — web UI username (empty = no auth)
+#define NVS_KEY_AUTH_PASS "auth_p"    // string  — web UI password

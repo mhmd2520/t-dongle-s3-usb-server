@@ -45,3 +45,8 @@ void lcd_set_backlight(uint8_t brightness);
 // Apply the current theme palette to all LCD colour variables and clear the screen.
 // Call after theme_load() in setup(), and after theme_save() for live preview.
 void lcd_apply_theme();
+
+// Show a QR code encoding url on the LCD for quick phone-camera access.
+// Draws on a white canvas regardless of active theme. Call lcd_invalidate_layout()
+// and lcd_show_status() afterward to return to the normal status screen.
+void lcd_show_qr(const char* url);

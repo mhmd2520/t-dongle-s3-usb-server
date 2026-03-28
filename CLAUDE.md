@@ -161,15 +161,15 @@ USB Server/
 | Webhook POST `/api/download`| `web_server`          | [ ] Todo |
 | Download queue (FreeRTOS)   | `downloader`          | [ ] Todo |
 | LCD download queue display  | `lcd`                 | [ ] Todo |
-| Auto-pack manifest download | `downloader`          | [ ] Todo |
+| Auto-pack manifest download | `downloader`          | [x] Done — v1.5.0, /_manifest.json, port 8080 |
 
 ### Advanced / Polish Features
 
 | Feature                     | Module                | Status   |
 |-----------------------------|-----------------------|----------|
-| QR code on LCD              | `lcd`                 | [ ] Todo |
-| Password protection (web)   | `web_server`+`config` | [ ] Todo |
-| Internal temp monitoring    | `main` + `lcd`        | [ ] Todo |
+| QR code on LCD              | `lcd`                 | [x] Done — v1.5.0, ricmoo/QRCode, 5s on boot |
+| Password protection (web)   | `web_server`+`config` | [x] Done — v1.5.0, HTTP Basic Auth, NVS, BOOT-reset |
+| Internal temp monitoring    | `main` + `lcd`        | [ ] Removed from scope |
 | SD card stats on LCD        | `storage` + `lcd`     | [x] Done |
 | Auto-AP fallback            | `wifi_manager`        | [x] Done |
 | File type icons on LCD      | `lcd`                 | [ ] Todo |
@@ -230,16 +230,15 @@ USB Server/
 - [x] Auto-AP fallback if saved WiFi is unreachable — moved to Phase 1
 - [x] mDNS: device accessible at `http://usbdrive.local` — moved to Phase 1
 
-### Phase 5 — Polish `[ ]`
+### Phase 5 — Polish `[x]` COMPLETE
 - [x] Themes: 3 palettes (moved to Phase 3) — done
-- [ ] Auto-pack: `manifest.json` on SD root lists URLs → one-tap sync all
-- [ ] QR code on LCD: encodes web UI URL on boot
-- [ ] Password protection: HTTP Basic Auth
-- [ ] Temperature sensor: warn on LCD if chip > 75°C, log to SD
+- [x] Auto-pack: `/_manifest.json` on SD → "Sync All" button → batch download, skips existing files
+- [x] QR code on LCD: encodes web UI URL on boot, 5-second display before status screen
+- [x] Password protection: HTTP Basic Auth (NVS-stored, both port 80 + 8080, BOOT button clears)
 - [x] Filter system files from file manager listing, search, and ZIP — `is_system_entry()` hides Windows (`System Volume Information`, `$RECYCLE.BIN`, `$*`), macOS (`._*`, `.Trashes`, `.Spotlight-V100`, `.fseventsd`), and internal temp file (`_dl_tmp.zip`)
-- [ ] ZIP temp file cleanup: delete `/_dl_tmp.zip` after streaming completes
+- [x] ZIP temp file cleanup: post-stream delete with error logging; Range-error early-exit path covered
 - [x] Sort WiFi scan results by RSSI (strongest first)
-- [ ] Track upload write errors: check `file.write()` return per chunk
+- [x] Track upload write errors: `write_fail_bytes` accumulated, returned in error JSON with `lost_bytes` field
 
 ---
 
@@ -267,7 +266,7 @@ USB Server/
 - [ ] Telegram: send `/download https://example.com/file.zip` → bot confirms → file appears
 - [ ] Webhook: `curl -X POST http://usbdrive.local/api/download -H "Content-Type: application/json" -d '{"url":"..."}'` → 200 OK → file queued
 - [x] Theme: change theme in web UI → LCD palette updates immediately
-- [ ] Auto-pack: `manifest.json` on SD → tap Sync → all listed URLs download
+- [x] Auto-pack: `/_manifest.json` on SD → tap "Sync All" → all listed URLs queued for download
 - [ ] Temp warning: simulate high temp → LCD warning appears
 
 ---
@@ -363,3 +362,9 @@ USB Server/
 | perf  | 2026-03-25 | **NVS cache in `fill_status_json()`**: `mode`, `ip_mode`, `s_ip`, `s_gw`, `s_mask` are read from NVS once on first `/api/status` or `/api/init` call, then served from static RAM. Two NVS open/close cycles per API call reduced to zero after first boot. |
 | perf  | 2026-03-25 | **LCD progress bar SPI row caching**: `lcd_show_progress()` now caches the formatted string for each of the 3 stats rows (size, speed, ETA). A row is only erased and redrawn when its string representation actually changes. Reduces SPI transactions by up to 66% per LCD update tick during downloads (ETA changes every second; size changes far less often). |
 | 3     | 2026-03-19 | **SD file download fix (take 6 — OPI PSRAM enabled)**: Root cause of all 5 prior failures confirmed: `ps_malloc()` always returned NULL because PSRAM was disabled (`CONFIG_SPIRAM not set` — dongles3 "No PSRAM variant" default). Take 5 PSRAM path never executed; always fell to `RESPONSE_TRY_AGAIN` fallback which loops forever when SD reads fail in `async_service_task` context. Fix: added `CONFIG_SPIRAM=y`, `CONFIG_SPIRAM_MODE_OCT=y`, `CONFIG_SPIRAM_SPEED_80M=y`, `CONFIG_SPIRAM_BOOT_INIT=y`, `CONFIG_SPIRAM_USE_CAPS_ALLOC=y` to `custom_sdkconfig` in `platformio.ini` — enables 8 MB OPI PSRAM on ESP32-S3R8V at boot. `ps_malloc(fileSize)` now succeeds; `handle_download` pre-reads file into PSRAM in main task, serves via `memcpy` lambda (zero SD I/O in async callback). SRAM fallback (`malloc`) added for files ≤ 64 KB as belt-and-suspenders. Broken `RESPONSE_TRY_AGAIN` fallback replaced with clean HTTP 507 for files too large for memory. Note: `board_build.arduino.memory_type = qio_opi` was tried but caused x509_crt_bundle.S duplicate-symbol assembler failure (pioarduino generator bug with that board variant); reverted — sdkconfig SPIRAM settings alone are sufficient for pioarduino hybrid builds. RAM 49.2%, Flash 34.5%. |
+| 5     | 2026-03-28 | **Upload write error tracking**: Added `write_fail_bytes` field to `UploadCtx`. `handle_upload_body()` accumulates `(len-w)` on every partial write. Completion handler returns `{"ok":false,"error":"write failed","lost_bytes":N}` with byte-accurate failure count. Activity log records "Write err N B lost @ K KB". Previously write failures silently produced a corrupt file with a success response. |
+| 5     | 2026-03-28 | **ZIP temp cleanup hardening**: `handle_dl()` in `dl_server.cpp` — added error log (`Serial.println`) if `SD_MMC.remove(ZIP_TMP_PATH)` returns false; added cleanup in the Range-Not-Satisfiable early-exit path (line 240) which previously skipped cleanup when the ZIP was served with a Range request. |
+| 5     | 2026-03-28 | **Password protection (HTTP Basic Auth)**: New `auth_check()` / `auth_cache_invalidate()` helpers in `web_server.cpp` read NVS keys `auth_u`/`auth_p` once and cache them. All 22 port-80 handlers except `handle_not_found` (captive portal) and HTTP OPTIONS (CORS) guard with `if (!auth_check(req)) return`. All 4 port-8080 handlers in `dl_server.cpp` guard with `dl_auth_check()`. New `POST /api/auth` endpoint saves/clears credentials. "Access Control" card added to dashboard. `wifi_reset_credentials()` also clears auth NVS keys — BOOT button 2s is the recovery path. Empty credentials = open access (backwards compatible). |
+| 5     | 2026-03-28 | **QR code on LCD at boot**: `ricmoo/QRCode ^0.0.1` added to `lib_deps`. New `lcd_show_qr(url)` in `lcd.cpp`: encodes URL via `qrcode_initText()` (Version 2/ECC_LOW for URLs ≤32 chars; Version 3 fallback). Renders on white canvas (80px wide, theme-agnostic). Version 2 → 3 px/module = 75px; Version 3 → 2 px/module = 58px. Caption "Scan to open" + truncated URL below QR. In `main.cpp`, called for 5 s after WiFi connects (both STA and AP modes), then `lcd_invalidate_layout()` + normal status screen. |
+| 5     | 2026-03-28 | **Auto-pack manifest download**: New `POST /manifest-sync` on port 8080 (`dl_server.cpp`, Core 1). Reads `/_manifest.json` (≤4096 bytes) from SD, parses `{"files":[{"url":"...","path":"..."},...]}` with ArduinoJson. Checks `SD_MMC.exists()` per entry — skips existing files. Calls `downloader_queue()` for new entries. Returns `{"ok":true,"queued":N,"skipped":M,"queue_full":K}`. "Auto-Pack Sync" card added to dashboard with "Sync All" button and manifest format hint. |
+| —     | 2026-03-28 | **Tagged v1.5.0** — Phase 5 (Polish) complete: upload error tracking, ZIP cleanup, password protection, QR code on LCD, auto-pack manifest sync. |

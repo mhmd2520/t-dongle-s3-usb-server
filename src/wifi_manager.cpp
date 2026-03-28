@@ -152,6 +152,12 @@ String wifi_ssid() {
 
 void wifi_reset_credentials() {
     Serial.println("[WiFi] Resetting credentials — restarting...");
+    // Clear auth credentials so the BOOT button also removes a forgotten password.
+    Preferences auth;
+    auth.begin(NVS_NS, false);
+    auth.remove(NVS_KEY_AUTH_USER);
+    auth.remove(NVS_KEY_AUTH_PASS);
+    auth.end();
     creds_clear();
     delay(300);
     ESP.restart();

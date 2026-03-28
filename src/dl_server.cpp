@@ -2,9 +2,12 @@
 #include "storage.h"
 #include "actlog.h"
 #include "lcd.h"
+#include "config.h"
+#include "downloader.h"
 #include <WebServer.h>
 #include <SD_MMC.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
@@ -50,6 +53,32 @@ static bool is_system_entry(const String& name) {
     if (name.equalsIgnoreCase(".fseventsd"))      return true;
     if (name == "_dl_tmp.zip")   return true;
     if (name == "_fileman.html") return true;
+    return false;
+}
+
+// ── HTTP Basic Auth (mirrors web_server.cpp cache) ────────────────────────────
+// Credentials shared with port 80 — same NVS keys. Cache invalidated by
+// dl_auth_cache_invalidate() which web_server calls when credentials change.
+static String s_auth_user;
+static String s_auth_pass;
+static bool   s_auth_loaded = false;
+
+void dl_auth_cache_invalidate() {
+    s_auth_loaded = false;
+}
+
+static bool dl_auth_check() {
+    if (!s_auth_loaded) {
+        Preferences p;
+        p.begin(NVS_NS, true);
+        s_auth_user = p.getString(NVS_KEY_AUTH_USER, "");
+        s_auth_pass = p.getString(NVS_KEY_AUTH_PASS, "");
+        p.end();
+        s_auth_loaded = true;
+    }
+    if (s_auth_user.isEmpty() || s_auth_pass.isEmpty()) return true;
+    if (s_dl_srv.authenticate(s_auth_user.c_str(), s_auth_pass.c_str())) return true;
+    s_dl_srv.requestAuthentication("USB Drive");
     return false;
 }
 
@@ -161,6 +190,7 @@ stream_done:
 
 // ── /files — File Manager HTML ────────────────────────────────────────────────
 static void handle_files_html() {
+    if (!dl_auth_check()) return;
     s_dl_srv.sendHeader("Access-Control-Allow-Origin", "*");
     if (!storage_is_ready()) {
         s_dl_srv.send(503, "text/plain", "SD not ready"); return;
@@ -183,6 +213,7 @@ static void handle_files_html() {
 // Range support lets Chrome resume an interrupted download from the byte it
 // stalled at rather than restarting from byte 0.
 static void handle_dl() {
+    if (!dl_auth_check()) return;
     s_dl_srv.sendHeader("Access-Control-Allow-Origin", "*");
     if (!storage_is_ready()) {
         s_dl_srv.send(503, "text/plain", "SD not ready"); return;
@@ -236,6 +267,10 @@ static void handle_dl() {
                     isRange    = true;
                     if (!f.seek(rangeStart)) {
                         f.close();
+                        if (path == ZIP_TMP_PATH) {
+                            if (!SD_MMC.remove(ZIP_TMP_PATH))
+                                Serial.println("[DL] Warning: temp ZIP cleanup failed (range-error path)");
+                        }
                         s_dl_srv.send(416, "text/plain", "Range Not Satisfiable");
                         return;
                     }
@@ -278,11 +313,15 @@ static void handle_dl() {
             snprintf(detail, sizeof(detail), "%s \u2192 PC", size_buf);
         actlog_add(ACT_DL, name.c_str(), detail);
     }
-    if (path == ZIP_TMP_PATH) SD_MMC.remove(ZIP_TMP_PATH);
+    if (path == ZIP_TMP_PATH) {
+        if (!SD_MMC.remove(ZIP_TMP_PATH))
+            Serial.println("[DL] Warning: temp ZIP cleanup failed");
+    }
 }
 
 // ── /list — directory listing ─────────────────────────────────────────────────
 static void handle_list() {
+    if (!dl_auth_check()) return;
     s_dl_srv.sendHeader("Access-Control-Allow-Origin", "*");
     if (!storage_is_ready()) {
         s_dl_srv.send(503, "application/json", "{\"error\":\"SD not ready\"}"); return;
@@ -373,6 +412,7 @@ static void search_walk(const String& sdp, const String& q, JsonArray arr, int& 
 }
 
 static void handle_search() {
+    if (!dl_auth_check()) return;
     s_dl_srv.sendHeader("Access-Control-Allow-Origin", "*");
     if (!storage_is_ready()) {
         s_dl_srv.send(503, "application/json", "{\"error\":\"SD not ready\"}"); return;
@@ -394,6 +434,80 @@ static void handle_search() {
     s_dl_srv.send(200, "application/json", json);
 }
 
+// ── /manifest-sync — read /_manifest.json from SD, queue new URLs ─────────────
+// Runs on Core 1 (dl_server_loop), so SD reads and downloader_queue() are safe.
+// Manifest format: {"files":[{"url":"https://..."},{"url":"...","path":"/dir/name.ext"}]}
+// Files already present on SD are skipped; only new files are queued for download.
+#define MANIFEST_PATH     "/_manifest.json"
+#define MANIFEST_BUF_SIZE 4096
+
+static void handle_manifest_sync() {
+    if (!dl_auth_check()) return;
+    s_dl_srv.sendHeader("Access-Control-Allow-Origin", "*");
+    if (!storage_is_ready()) {
+        s_dl_srv.send(503, "application/json", "{\"error\":\"SD not ready\"}"); return;
+    }
+
+    File mf = SD_MMC.open(MANIFEST_PATH, FILE_READ);
+    if (!mf || mf.isDirectory()) {
+        if (mf) mf.close();
+        s_dl_srv.send(404, "application/json",
+                      "{\"error\":\"/_manifest.json not found on SD\"}");
+        return;
+    }
+
+    // Read manifest (cap at MANIFEST_BUF_SIZE to protect heap).
+    static char s_manifest_buf[MANIFEST_BUF_SIZE + 1];
+    size_t n = mf.read((uint8_t*)s_manifest_buf, MANIFEST_BUF_SIZE);
+    mf.close();
+    if (n == 0) {
+        s_dl_srv.send(400, "application/json", "{\"error\":\"empty manifest\"}"); return;
+    }
+    s_manifest_buf[n] = '\0';
+
+    JsonDocument doc;
+    DeserializationError jerr = deserializeJson(doc, s_manifest_buf);
+    if (jerr) {
+        s_dl_srv.send(400, "application/json", "{\"error\":\"invalid JSON\"}"); return;
+    }
+    JsonArray files = doc["files"].as<JsonArray>();
+    if (files.isNull()) {
+        s_dl_srv.send(400, "application/json",
+                      "{\"error\":\"missing 'files' array\"}"); return;
+    }
+
+    int queued = 0, skipped = 0, q_full = 0;
+    for (JsonObject entry : files) {
+        const char* url  = entry["url"];
+        const char* path = entry["path"];   // optional explicit target path
+
+        if (!url || url[0] == '\0') { skipped++; continue; }
+
+        // Determine target path for the existence check.
+        String target;
+        if (path && path[0] != '\0') {
+            target = String(path);
+        } else {
+            target = "/" + downloader_quick_filename(url);
+        }
+
+        // Skip files already present on SD (idempotent sync).
+        if (SD_MMC.exists(target.c_str())) { skipped++; continue; }
+
+        if (downloader_queue(url)) {
+            queued++;
+        } else {
+            q_full++;   // DL_QUEUE_SIZE exceeded
+        }
+    }
+
+    char resp[96];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"queued\":%d,\"skipped\":%d,\"queue_full\":%d}",
+             queued, skipped, q_full);
+    s_dl_srv.send(200, "application/json", resp);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 void dl_server_begin() {
@@ -402,10 +516,11 @@ void dl_server_begin() {
     write_fileman_html_to_sd();
     const char* collectHdrs[] = { "Range" };
     s_dl_srv.collectHeaders(collectHdrs, 1);
-    s_dl_srv.on("/files",  HTTP_GET, handle_files_html);
-    s_dl_srv.on("/dl",     HTTP_GET, handle_dl);
-    s_dl_srv.on("/list",   HTTP_GET, handle_list);
-    s_dl_srv.on("/search", HTTP_GET, handle_search);
+    s_dl_srv.on("/files",         HTTP_GET,  handle_files_html);
+    s_dl_srv.on("/dl",            HTTP_GET,  handle_dl);
+    s_dl_srv.on("/list",          HTTP_GET,  handle_list);
+    s_dl_srv.on("/search",        HTTP_GET,  handle_search);
+    s_dl_srv.on("/manifest-sync", HTTP_POST, handle_manifest_sync);
     s_dl_srv.begin();
     Serial.println("[HTTP] Download server started on port 8080");
 }

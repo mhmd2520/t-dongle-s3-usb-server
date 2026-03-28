@@ -3,6 +3,7 @@
 #include "themes.h"
 #include <LovyanGFX.hpp>
 #include <Preferences.h>
+#include <qrcode.h>
 
 // ── LovyanGFX display config for T-Dongle-S3 (ST7735S 80×160) ────────────────
 class LGFX : public lgfx::LGFX_Device {
@@ -519,4 +520,67 @@ void lcd_set_backlight(uint8_t brightness) {
     // Phase 5 will replace this with ledcWrite PWM.
     // For now: any non-zero value = on.
     digitalWrite(PIN_LCD_BL, brightness > 0 ? LOW : HIGH);
+}
+
+void lcd_show_qr(const char* url) {
+    // ricmoo/QRCode library — qrcode_getBufferSize(v) = ceil((modules^2)/8).
+    // Version 2 (25 modules) holds up to 32 bytes in ECC_LOW byte mode — enough
+    // for any LAN IP ("http://192.168.xxx.xxx" = 22 chars).
+    // Version 3 (29 modules) holds up to 53 bytes — fallback for longer URLs.
+    // Fixed 200-byte buffer covers Version 2 (79 B) and Version 3 (106 B).
+    static uint8_t qr_buf[200];
+    QRCode qr;
+
+    // Try Version 2 first; fall back to Version 3 for longer URLs.
+    uint8_t ver = 2;
+    if (qrcode_initText(&qr, qr_buf, ver, ECC_LOW, url) != 0) {
+        ver = 3;
+        if (200 < (int)qrcode_getBufferSize(ver) ||
+            qrcode_initText(&qr, qr_buf, ver, ECC_LOW, url) != 0) {
+            Serial.println("[QR] URL too long for Version 3 — skipping QR display");
+            return;
+        }
+    }
+
+    // Pixel size per module: Version 2 → 25 modules, 3 px/module = 75 px (fits in 80).
+    //                        Version 3 → 29 modules, 2 px/module = 58 px.
+    uint8_t mod_px = (ver == 2) ? 3 : 2;
+    uint8_t qr_px  = qr.size * mod_px;                 // total QR pixel dimension
+    uint8_t x_off  = (uint8_t)((LCD_W - qr_px) / 2);  // horizontal centering
+    uint8_t y_off  = 18;                                // 4 px below header (HDR_H=14)
+
+    // Draw white canvas over content area (QR needs high contrast, theme-agnostic).
+    tft.fillRect(0, HDR_H, LCD_W, FTR_Y - HDR_H, 0xFFFF);
+
+    // Render QR modules: dark=black (0x0000), light=white (0xFFFF).
+    for (uint8_t qy = 0; qy < qr.size; qy++) {
+        for (uint8_t qx = 0; qx < qr.size; qx++) {
+            uint16_t col = qrcode_getModule(&qr, qx, qy) ? 0x0000u : 0xFFFFu;
+            tft.fillRect(x_off + qx * mod_px, y_off + qy * mod_px,
+                         mod_px, mod_px, col);
+        }
+    }
+
+    // "Scan to open" caption below the QR matrix.
+    uint8_t cap_y = y_off + qr_px + 7;
+    tft.setTextColor(0x0000u, 0xFFFFu);   // black on white
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(1);
+    tft.drawString("Scan to open", LCD_W / 2, cap_y);
+
+    // URL line (truncated to 13 chars if needed — LCD_W=80 px, size-1 = ~6px/char).
+    char url_short[14];
+    strncpy(url_short, url, 13);
+    url_short[13] = '\0';
+    tft.setTextColor(0x001Fu, 0xFFFFu);   // dark blue on white
+    tft.drawString(url_short, LCD_W / 2, cap_y + 14);
+
+    // Footer: keep theme colours so the hint is visible.
+    tft.drawFastHLine(0, FTR_Y, LCD_W, C_DIM);
+    tft.setTextColor(C_DIM, 0xFFFFu);
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString("BOOT: switch", 3, FTR_TY);
+
+    // Preserve the QR header bar (re-use existing draw_header).
+    draw_header("SCAN TO CONNECT");
 }

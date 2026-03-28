@@ -28,6 +28,40 @@ static AsyncWebServer server(80);
 // Non-zero = restart at this millis() timestamp (after response is sent).
 static uint32_t g_restart_at = 0;
 
+// ── HTTP Basic Auth ────────────────────────────────────────────────────────────
+// Credentials are stored in NVS under NVS_NS/NVS_KEY_AUTH_USER+PASS.
+// Empty username or password = no auth (open access, backwards compatible).
+// Cache is invalidated by auth_cache_invalidate() when credentials change.
+static String s_auth_user;
+static String s_auth_pass;
+static bool   s_auth_loaded = false;
+
+static void auth_load() {
+    if (s_auth_loaded) return;
+    Preferences p;
+    p.begin(NVS_NS, true);
+    s_auth_user = p.getString(NVS_KEY_AUTH_USER, "");
+    s_auth_pass = p.getString(NVS_KEY_AUTH_PASS, "");
+    p.end();
+    s_auth_loaded = true;
+}
+
+static void auth_cache_invalidate() {
+    s_auth_loaded = false;
+    dl_auth_cache_invalidate();  // keep port 8080 in sync
+}
+
+// Returns true if authorized (or no credentials set). Sends 401 and returns
+// false if the request lacks valid credentials. Insert at the top of every
+// handler that should be protected. handle_not_found is exempt (captive portal).
+static bool auth_check(AsyncWebServerRequest* req) {
+    auth_load();
+    if (s_auth_user.isEmpty() || s_auth_pass.isEmpty()) return true;
+    if (req->authenticate(s_auth_user.c_str(), s_auth_pass.c_str())) return true;
+    req->requestAuthentication("USB Drive");
+    return false;
+}
+
 // ── Busy-flag: prevents concurrent heavy SD operations ────────────────────────
 // AsyncWebServer can serve multiple requests concurrently on dual-core ESP32-S3.
 // Heavy SD operations (download / ZIP / upload) set this flag; a second request
@@ -585,6 +619,24 @@ input,select{width:100%;padding:8px;background:#1c1c1c;border:1px solid #2a2a2a;
   <div class="msg" id="th-msg"></div>
 </div>
 
+<div class="card"><h2>Auto-Pack Sync</h2>
+  <p style="font-size:.8em;color:#666;margin-bottom:6px">Place <code style="color:#fa0">/_manifest.json</code> on the SD card to batch-download files. Already-present files are skipped.</p>
+  <p style="font-size:.75em;color:#444;margin-bottom:8px">Format: <code style="color:#888">{"files":[{"url":"https://..."},{"url":"...","path":"/folder/file.ext"}]}</code></p>
+  <button class="btn cyan" onclick="syncManifest()">&#8635; Sync All</button>
+  <div class="msg" id="mn-msg"></div>
+</div>
+
+<div class="card"><h2>Access Control</h2>
+  <p style="font-size:.8em;color:#666;margin-bottom:6px">Protect the web UI with a password. Leave both fields blank to remove protection.</p>
+  <label>Username</label>
+  <input type="text" id="a-user" placeholder="e.g. admin" autocomplete="username">
+  <label>Password</label>
+  <input type="password" id="a-pass" placeholder="Leave blank to disable auth" autocomplete="new-password">
+  <button class="btn cyan" onclick="saveAuth()">Save Access Control</button>
+  <p style="font-size:.73em;color:#555;margin-top:6px">&#128272; To recover a forgotten password: hold BOOT button 2s &#8594; resets WiFi &amp; password.</p>
+  <div class="msg" id="a-msg"></div>
+</div>
+
 <script>
 var d={},g_wf=false;
 function toast(id,t,ok){var e=document.getElementById(id);e.textContent=t;e.className='msg '+(ok?'ok':'ng');setTimeout(function(){e.className='msg'},3500);}
@@ -661,6 +713,24 @@ async function applyTheme(i){
   var r=await api('/api/theme',{id:i});
   toast('th-msg',r.ok?'Theme applied!':'Error.',r.ok);
 }
+async function syncManifest(){
+  var host=location.hostname;
+  toast('mn-msg','Reading manifest\u2026',true);
+  try{
+    var r=await fetch('http://'+host+':8080/manifest-sync',{method:'POST'});
+    var j=await r.json();
+    if(j.ok) toast('mn-msg','Queued: '+j.queued+', Skipped: '+j.skipped+(j.queue_full?', Queue full: '+j.queue_full:''),true);
+    else toast('mn-msg',j.error||'Error',false);
+  }catch(e){toast('mn-msg','Cannot reach port 8080',false);}
+}
+async function saveAuth(){
+  var u=document.getElementById('a-user').value.trim();
+  var pw=document.getElementById('a-pass').value;
+  if(pw===''&&u!==''){toast('a-msg','Enter a password or clear both fields.',false);return;}
+  var r=await api('/api/auth',{user:u,pass:pw});
+  if(r.ok){document.getElementById('a-user').value='';document.getElementById('a-pass').value='';}
+  toast('a-msg',r.ok?(pw?'Password set. You will be prompted next request.':'Auth removed.'):'Error saving.',r.ok);
+}
 loadInit();setInterval(load,12000);setInterval(loadNets,30000);
 </script>
 )html";
@@ -668,6 +738,7 @@ loadInit();setInterval(load,12000);setInterval(loadNets,30000);
 // ── Route handlers ─────────────────────────────────────────────────────────────
 
 static void handle_root(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     Serial.printf("[HTTP] GET / from %s\n", req->client()->remoteIP().toString().c_str());
     String page = PAGE_HTML;
     page.replace("DEVICE_NAME", "'" DEVICE_NAME "'");
@@ -677,6 +748,7 @@ static void handle_root(AsyncWebServerRequest* req) {
 }
 
 static void handle_files_html(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     // FILEMAN_HTML (16 KB) is served from port 8080 (synchronous WebServer,
     // Core 1) where large responses always deliver reliably. ESPAsyncWebServer
     // (async_service_task, Core 0) intermittently truncates responses > ~8 KB.
@@ -752,6 +824,7 @@ static void fill_status_json(JsonDocument& doc) {
 }
 
 static void handle_status(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     JsonDocument doc;
     fill_status_json(doc);
     String json;
@@ -761,6 +834,7 @@ static void handle_status(AsyncWebServerRequest* req) {
 
 // /api/init — status + WiFi scan in one round-trip (saves one HTTP connection)
 static void handle_init(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     // Never trigger a scan on page load — in both modes the user clicks ↻ Refresh.
     JsonDocument doc;
     fill_status_json(doc);
@@ -776,6 +850,7 @@ static void handle_init(AsyncWebServerRequest* req) {
 }
 
 static void handle_scan(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     // Scan is triggered ONLY when the browser explicitly passes ?start=1
     // (the Refresh button). Without start=1 this is read-only (returns cache).
     // This way setInterval(loadNets) never starts a scan automatically in AP mode.
@@ -787,6 +862,7 @@ static void handle_scan(AsyncWebServerRequest* req) {
 }
 
 static void handle_busy(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     if (s_busy) {
         String j = "{\"busy\":true,\"op\":\""; j += s_busy_op; j += "\"}";
         send_json(req, 200, j);
@@ -796,6 +872,7 @@ static void handle_busy(AsyncWebServerRequest* req) {
 }
 
 static void handle_mode(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     String mode_s = qparam(req, "mode");
     int mode = mode_s.toInt();
     if (mode != (int)MODE_NETWORK && mode != (int)MODE_USB_DRIVE) {
@@ -813,6 +890,7 @@ static void handle_mode(AsyncWebServerRequest* req) {
 }
 
 static void handle_wifi(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     String ssid = qparam(req, "ssid");
     if (ssid.isEmpty()) {
         send_json(req, 400, "{\"ok\":false,\"error\":\"ssid required\"}");
@@ -838,6 +916,7 @@ static void handle_wifi(AsyncWebServerRequest* req) {
 }
 
 static void handle_wifi_reset(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     Preferences p;
     p.begin("wifi", false);
     p.clear();
@@ -847,6 +926,7 @@ static void handle_wifi_reset(AsyncWebServerRequest* req) {
 }
 
 static void handle_theme(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     int id = qparam(req, "id").toInt();
     if (id < 0 || (uint8_t)id >= theme_count()) {
         send_json(req, 400, "{\"ok\":false,\"error\":\"invalid theme\"}");
@@ -918,6 +998,7 @@ static uint8_t s_dl_buf[16384];
 // stalling async_service_task and making the entire web server unresponsive.
 // Redirecting everything to port 8080 means zero SD I/O in async_service_task.
 static void handle_download(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     if (!storage_is_ready()) {
         send_json(req, 503, "{\"error\":\"SD not ready\"}"); return;
     }
@@ -1145,6 +1226,7 @@ static void run_deferred_zip() {
 
 // handle_download_zip — responds immediately; JS polls /api/zip-status.
 static void handle_download_zip(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     if (!busy_try("zip")) { send_busy(req); return; }
     if (!storage_is_ready()) {
         busy_clear();
@@ -1178,6 +1260,7 @@ static void handle_download_zip(AsyncWebServerRequest* req) {
 
 // /api/zip-status — JS polls this while ZIP is building.
 static void handle_zip_status(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     if (g_zip_state == ZIP_STATE_DONE) {
         // Ensure g_zip_done_json is fully visible before clearing state (Xtensa LX7 has
         // relaxed memory ordering for volatile; explicit barrier matches Core 1 release).
@@ -1201,12 +1284,26 @@ struct UploadCtx {
     File     file;
     bool     ok  = false;
     bool     busy_held = false;
+    uint32_t write_fail_bytes = 0;
 };
 
 static void handle_upload(AsyncWebServerRequest* req) {
     // Called after all body chunks are received.
+    if (!auth_check(req)) {
+        // Auth failed: clean up any partial upload that was set up in handle_upload_body
+        UploadCtx* ctx = req->_tempObject ? (UploadCtx*)req->_tempObject : nullptr;
+        if (ctx) {
+            if (ctx->file) ctx->file.close();
+            if (ctx->busy_held) busy_clear();
+            delete ctx;
+            req->_tempObject = nullptr;
+        }
+        g_upload_lcd_active = false;
+        return;
+    }
     UploadCtx* ctx = req->_tempObject ? (UploadCtx*)req->_tempObject : nullptr;
     bool ok = ctx && ctx->ok;
+    uint32_t fail_bytes = ctx ? ctx->write_fail_bytes : 0;
     String fname;
     if (ctx) {
         if (ctx->file) { fname = ctx->file.name(); ctx->file.close(); }
@@ -1228,14 +1325,22 @@ static void handle_upload(AsyncWebServerRequest* req) {
             actlog_add(ACT_UPLOAD, bname.c_str(), detail);
         } else {
             uint32_t got = g_upload_lcd_bytes;
-            char detail[48];
-            if (got >= 1024) snprintf(detail, sizeof(detail), "Failed @ %d KB", (int)(got / 1024));
-            else             strncpy(detail, "Upload failed", sizeof(detail));
+            char detail[64];
+            if (fail_bytes > 0)  snprintf(detail, sizeof(detail), "Write err %u B lost @ %d KB", fail_bytes, (int)(got / 1024));
+            else if (got >= 1024) snprintf(detail, sizeof(detail), "Failed @ %d KB", (int)(got / 1024));
+            else                 strncpy(detail, "Upload failed", sizeof(detail));
             actlog_add(ACT_WARN, bname.c_str(), detail);
         }
     }
-    send_json(req, ok ? 200 : 500,
-              ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"upload failed\"}");
+    if (fail_bytes > 0) {
+        char errbuf[80];
+        snprintf(errbuf, sizeof(errbuf),
+                 "{\"ok\":false,\"error\":\"write failed\",\"lost_bytes\":%u}", fail_bytes);
+        send_json(req, 500, errbuf);
+    } else {
+        send_json(req, ok ? 200 : 500,
+                  ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"upload failed\"}");
+    }
 }
 
 static void handle_upload_body(AsyncWebServerRequest* req,
@@ -1279,13 +1384,17 @@ static void handle_upload_body(AsyncWebServerRequest* req,
     UploadCtx* ctx = req->_tempObject ? (UploadCtx*)req->_tempObject : nullptr;
     if (ctx && ctx->file && len > 0) {
         size_t w = ctx->file.write(data, len);
-        if (w != len) ctx->ok = false;
+        if (w != len) {
+            ctx->write_fail_bytes += (uint32_t)(len - w);
+            ctx->ok = false;
+        }
         // Update byte counter for LCD (Core 1 reads this)
         g_upload_lcd_bytes = (uint32_t)(index + len);
     }
 }
 
 static void handle_delete(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     String path = qparam(req, "path");
     if (path.isEmpty() || !safe_path(path)) { send_json(req, 400, "{\"ok\":false}"); return; }
     bool ok = SD_MMC.remove(path) || SD_MMC.rmdir(path);
@@ -1294,6 +1403,7 @@ static void handle_delete(AsyncWebServerRequest* req) {
 }
 
 static void handle_mkdir(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     String path = qparam(req, "path");
     if (path.isEmpty() || !safe_path(path)) { send_json(req, 400, "{\"ok\":false}"); return; }
     bool ok = SD_MMC.mkdir(path);
@@ -1302,6 +1412,7 @@ static void handle_mkdir(AsyncWebServerRequest* req) {
 }
 
 static void handle_rename(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     String from = qparam(req, "from");
     String to   = qparam(req, "to");
     if (from.isEmpty() || to.isEmpty() || !safe_path(from) || !safe_path(to)) {
@@ -1319,6 +1430,7 @@ static void handle_rename(AsyncWebServerRequest* req) {
 // ── URL downloader routes ─────────────────────────────────────────────────────
 
 static void handle_api_download(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     String url = qparam(req, "url");
     if (url.isEmpty()) {
         send_json(req, 400, "{\"ok\":false,\"error\":\"url required\"}");
@@ -1343,6 +1455,7 @@ static void handle_api_download(AsyncWebServerRequest* req) {
 }
 
 static void handle_dl_status(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     JsonDocument doc;
     doc["active"]       = downloader_is_busy();
     doc["progress"]     = downloader_progress();
@@ -1359,11 +1472,13 @@ static void handle_dl_status(AsyncWebServerRequest* req) {
 }
 
 static void handle_dl_cancel(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     downloader_cancel();
     send_json(req, 200, "{\"ok\":true}");
 }
 
 static void handle_dl_resolve(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     String action = qparam(req, "action");
     if (action != "replace" && action != "skip" && action != "cancel") {
         send_json(req, 400, "{\"ok\":false,\"error\":\"invalid action\"}");
@@ -1374,8 +1489,27 @@ static void handle_dl_resolve(AsyncWebServerRequest* req) {
 }
 
 static void handle_log(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;
     String json = actlog_get_json();
     send_json(req, 200, json);
+}
+
+static void handle_auth(AsyncWebServerRequest* req) {
+    if (!auth_check(req)) return;   // must be authed to change credentials
+    String user = qparam(req, "user");
+    String pass = qparam(req, "pass");
+    Preferences p;
+    p.begin(NVS_NS, false);
+    if (pass.isEmpty()) {
+        p.remove(NVS_KEY_AUTH_USER);
+        p.remove(NVS_KEY_AUTH_PASS);
+    } else {
+        p.putString(NVS_KEY_AUTH_USER, user);
+        p.putString(NVS_KEY_AUTH_PASS, pass);
+    }
+    p.end();
+    auth_cache_invalidate();   // also invalidates dl_server cache via dl_auth_cache_invalidate()
+    send_json(req, 200, "{\"ok\":true}");
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────────
@@ -1402,6 +1536,7 @@ void web_server_begin() {
     server.on("/api/dl-cancel",  HTTP_POST, handle_dl_cancel);
     server.on("/api/dl-resolve", HTTP_POST, handle_dl_resolve);
     server.on("/api/log",        HTTP_GET,  handle_log);
+    server.on("/api/auth",       HTTP_POST, handle_auth);
     // Upload: completion handler + body handler (raw binary, no multipart)
     server.on("/upload", HTTP_POST, handle_upload, nullptr, handle_upload_body);
     // CORS preflight: Chrome sends OPTIONS before non-simple cross-origin requests
